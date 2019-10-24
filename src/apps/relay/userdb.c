@@ -532,7 +532,9 @@ int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, u08bits *u
 		return ret;
 	}
 
-	if(turn_params.use_auth_secret_with_timestamp) {
+	// --twinlife-- 191024
+	if(turn_params.use_auth_secret_with_timestamp && strchr((char*)usname,turn_params.rest_api_separator)) {
+	// --twinlife-- 191024
 
 		turn_time_t ctime = (turn_time_t) time(NULL);
 		turn_time_t ts = 0;
@@ -715,7 +717,9 @@ void release_allocation_quota(u08bits *user, int oauth, u08bits *realm)
 int add_static_user_account(char *user)
 {
 	/* Realm is either default or empty for users taken from file or command-line */
-	if(user && !turn_params.use_auth_secret_with_timestamp) {
+	// --twinlife-- 191024
+        if(user /* && !turn_params.use_auth_secret_with_timestamp*/) {
+	// --twinlife-- 191024
 		char *s = strstr(user, ":");
 		if(!s || (s==user) || (strlen(s)<2)) {
 			TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong user account: %s\n",user);

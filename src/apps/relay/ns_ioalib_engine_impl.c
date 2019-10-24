@@ -3029,9 +3029,11 @@ int udp_send(ioa_socket_handle s, const ioa_addr* dest_addr, const s08bits* buff
 		}
 
 		if(rc<0) {
-			if((errno == ENOBUFS) || (errno == EAGAIN)) {
-				//Lost packet due to overload ... fine.
+			// --twinlife-- 191024
+		        if((errno == ENOBUFS) || (errno == EAGAIN) || (errno == EPERM)) {
+				//Lost packet due to overload or firewall drop... fine.
 				rc = len;
+			// --twinlife-- 191024
 			} else if(is_connreset()) {
 				if(try_again) {
 					try_again = 0;
