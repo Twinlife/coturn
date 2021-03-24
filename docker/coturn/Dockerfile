@@ -1,25 +1,49 @@
-### 1. stage: create build image
-FROM debian:stable AS coturn-build
+### 1. stage: create mongoc image
+FROM debian:stable-slim AS mongoc-build
+
+ENV MONGO_LIB_VERSION 1.17.4
+
+# Install build dependencies
+RUN export DEBIAN_FRONTEND=noninteractive && \
+	apt-get update && \
+	apt-get install -y build-essential git python cmake
+RUN apt-get install -y libssl-dev
+RUN git clone https://github.com/mongodb/mongo-c-driver.git && \
+    cd mongo-c-driver && \
+    git checkout ${MONGO_LIB_VERSION} && \
+    python build/calc_release_version.py > VERSION_CURRENT  && \
+    mkdir -p cmake-build/install && \
+    cd cmake-build && \
+    cmake -DENABLE_AUTOMATIC_INIT_AND_CLEANUP=OFF -DCMAKE_BUILD_TYPE=Release .. && \
+    DESTDIR=/mongo-c-driver/cmake-build/install cmake --build . --target install
+
+RUN cd /mongo-c-driver/cmake-build/install && tar -cf /mongoc.tar .
+
+### 2. stage: create build image
+FROM debian:stable-slim AS coturn-build
 
 ENV BUILD_PREFIX /usr/local/src
 
 # Install build dependencies
 RUN export DEBIAN_FRONTEND=noninteractive && \
 	apt-get update && \
-	apt-get install -y build-essential git debhelper dpkg-dev libssl-dev libevent-dev sqlite3 libsqlite3-dev postgresql-client libpq-dev default-mysql-client default-libmysqlclient-dev libhiredis-dev libmongoc-dev libbson-dev
+	apt-get install -y build-essential git debhelper dpkg-dev pkg-config libssl-dev libevent-dev sqlite3 libsqlite3-dev postgresql-client libpq-dev default-mysql-client default-libmysqlclient-dev libhiredis-dev libsystemd-dev
+
+COPY --from=mongoc-build /mongoc.tar /tmp
+RUN tar -xf /tmp/mongoc.tar -C /
 
 # Clone Coturn
 WORKDIR ${BUILD_PREFIX}
 RUN git clone https://github.com/coturn/coturn.git
 
 # Build Coturn
-WORKDIR coturn
+WORKDIR ${BUILD_PREFIX}/coturn
 RUN ./configure
 RUN make
 
-### 2. stage: create production image
+### 3. stage: create production image
 
-FROM debian:stable AS coturn
+FROM debian:stable-slim AS production
 
 ENV INSTALL_PREFIX /usr/local
 ENV BUILD_PREFIX /usr/local/src
@@ -31,17 +55,68 @@ COPY --from=coturn-build ${BUILD_PREFIX}/coturn/man/ ${INSTALL_PREFIX}/man/
 #COPY turnserver.conf ${INSTALL_PREFIX}/etc
 COPY --from=coturn-build ${BUILD_PREFIX}/coturn/sqlite/turndb ${INSTALL_PREFIX}/var/db/turndb
 COPY --from=coturn-build ${BUILD_PREFIX}/coturn/turndb ${INSTALL_PREFIX}/turndb
+
+COPY --from=mongoc-build /mongoc.tar /tmp
+RUN tar -xf /tmp/mongoc.tar -C / && rm /tmp/mongoc.tar
+
 # Install lib dependencies
 RUN export DEBIAN_FRONTEND=noninteractive && \
 	apt-get update && \
-	apt-get install -y libc6>=2.15 libevent-core-2.1-6>=libevent-core-2.1-6 libevent-extra-2.1-6>=2.1.8-stable-4 libevent-openssl-2.1-6>=2.1.8-stable-4 libevent-pthreads-2.1-6>=2.1.8-stable-4 libhiredis0.14>=0.14.0 libmariadbclient-dev>=10.3.17 libpq5>=8.4~ libsqlite3-0>=3.6.0 libssl1.1>=1.1.0 libmongoc-1.0 libbson-1.0
+	apt-get install -y libc6 libsasl2-2 libevent-2.1 libevent-core-2.1-6 libevent-extra-2.1-6 libevent-openssl-2.1-6 libevent-pthreads-2.1-6 libhiredis0.14 libmariadbclient-dev libpq5 libsqlite3-0 libssl1.1 && \
+	apt-get clean && rm -f /var/lib/apt/lists/*_*
+
+RUN if ! getent group "$TURNSERVER_GROUP" >/dev/null; then \
+        addgroup --system "$TURNSERVER_GROUP" || exit 1 ;\
+    fi \
+    && \
+    if ! getent passwd "$TURNSERVER_USER" >/dev/null; then \
+        adduser --system \
+           --home / \
+           --shell /bin/false \
+           --no-create-home \
+           --ingroup "$TURNSERVER_GROUP" \
+           --disabled-password \
+           --disabled-login \
+           --gecos "turnserver daemon" \
+               "$TURNSERVER_USER" || exit 1; \
+    fi
+
+WORKDIR ${INSTALL_PREFIX}
+CMD ${INSTALL_PREFIX}/bin/turnserver
+
+
+### 4. stage: create testing
+
+FROM debian:stable-slim as coturn
+
+ENV INSTALL_PREFIX /usr/local
+ENV BUILD_PREFIX /usr/local/src
+ENV TURNSERVER_GROUP turnserver
+ENV TURNSERVER_USER turnserver
+
+COPY --from=coturn-build ${BUILD_PREFIX}/coturn/bin/ ${INSTALL_PREFIX}/bin/
+COPY --from=coturn-build ${BUILD_PREFIX}/coturn/man/ ${INSTALL_PREFIX}/man/
+#COPY turnserver.conf ${INSTALL_PREFIX}/etc
+COPY --from=coturn-build ${BUILD_PREFIX}/coturn/sqlite/turndb ${INSTALL_PREFIX}/var/db/turndb
+COPY --from=coturn-build ${BUILD_PREFIX}/coturn/turndb ${INSTALL_PREFIX}/turndb
+
+COPY --from=mongoc-build /mongoc.tar /tmp
+RUN tar -xf /tmp/mongoc.tar -C / && rm /tmp/mongoc.tar
+
+# Install lib dependencies
+RUN export DEBIAN_FRONTEND=noninteractive && \
+	apt-get update && \
+	apt-get install -y libc6 libsasl2-2 libevent-2.1 libevent-core-2.1-6 libevent-extra-2.1-6 libevent-openssl-2.1-6 libevent-pthreads-2.1-6 libhiredis0.14 libmariadbclient-dev libpq5 libsqlite3-0 libssl1.1
 RUN apt-get install -y default-mysql-client postgresql-client redis-tools
+
+# Workaround for MongoDB
+RUN ln -s /bin/echo /bin/systemctl
 
 # Install MongoDB
 RUN apt-get update && \
   apt-get install -y wget gnupg && \
-  wget -qO - https://www.mongodb.org/static/pgp/server-4.0.asc | apt-key add - && \
-  echo "deb http://repo.mongodb.org/apt/debian stretch/mongodb-org/4.0 main" | tee /etc/apt/sources.list.d/mongodb-org-4.0.list && \
+  wget -qO - https://www.mongodb.org/static/pgp/server-4.4.asc | apt-key add - && \
+  echo "deb http://repo.mongodb.org/apt/debian stretch/mongodb-org/4.4 main" | tee /etc/apt/sources.list.d/mongodb-org-4.4.list && \
   echo "deb http://deb.debian.org/debian/ stretch main" | tee /etc/apt/sources.list.d/debian-stretch.list && \
   apt-get update && \
   apt-get install -y libcurl3 mongodb-org mongodb-org-server mongodb-org

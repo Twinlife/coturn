@@ -27,7 +27,17 @@ to run the programs. The scripts are meant to be run from examples/ sub-director
 $ cd examples
 $ ./scripts/secure_relay.sh
 
+SYSTEMD
+
+If the systemd development library is available, then it will notify systemd about the server status.
+
 RUNNING THE TURN SERVER
+
+To run the coturn server as a daemon use:
+
+  $ turnserver -o
+
+Note that if you make any changes to the config file the server has to be restarted.
 
 Options note: turnserver has long and short option names, for most options.
 Some options have only long form, some options have only short form. Their syntax
@@ -225,6 +235,12 @@ Flags:
 			name will be constructed as-is, without PID and date appendage.
 			This option can be used, for example, together with the logrotate tool.
 
+--new-log-timestamp				Enable full ISO-8601 timestamp in all logs.
+
+--new-log-timestamp-format    	<format>	Set timestamp format (in strftime(1) format)
+
+--log-binding					Log STUN binding request. It is now disabled by default to avoid DoS attacks.
+
 --secure-stun		Require authentication of the STUN Binding request.
 			By default, the clients are allowed anonymous access to the STUN Binding functionality.
 
@@ -265,6 +281,9 @@ Flags:
 			check: across the session, all requests must have the same
 			main ORIGIN attribute value (if the ORIGIN was
 			initially used by the session).
+ --prometheus		Enable prometheus metrics. By default it is
+			disabled. Would listen on port 9641 unther the path /metrics
+			also the path / on this port can be used as a health check
 
 -h			Help.
 
@@ -272,6 +291,7 @@ Options with values:
 
 --stale-nonce[=<value>]		Use extra security with nonce value having
 							limited lifetime, in seconds (default 600 secs).
+							Set it to 0 for unlimited nonce lifetime.
 
 --max-allocate-lifetime		Set the maximum value for the allocation lifetime.
 							Default to 3600 secs.
@@ -540,15 +560,28 @@ Options with values:
 			Default is /var/run/turnserver.pid (if superuser account is used) or
 			/var/tmp/turnserver.pid .
 
+--acme-redirect  <URL>	Redirect ACME/RFC8555 (like Let's Encrypt challenge) requests, i.e.
+			HTTP GET requests matching '^/.well-known/acme-challenge/(.*)'
+			to <URL>$1 with $1 == (.*). No validation of <URL> will be done,
+			so make sure you do not forget the trailing slash. If <URL> is an empty
+			string (the default value), no special handling of such requests will be done.
+
 --proc-user		User name to run the process. After the initialization, the turnserver process
 			will make an attempt to change the current user ID to that user.
 
 --proc-group		Group name to run the process. After the initialization, the turnserver process
 			will make an attempt to change the current group ID to that group.
 
--K, --keep-address-family		TURN server allocates address family according TURN
+-K, --keep-address-family			Deprecated and will be removed in favor of --allocation-default-address-family!!
+			TURN server allocates address family according TURN
 			Client <=> Server communication address family.
 			!! It breaks RFC6156 section-4.2 (violates default IPv4) !!
+
+-A --allocation-default-address-family=<ipv4|ipv6|keep> 		Default is IPv4
+			TURN server allocates address family according TURN client requested address family.
+			If address family not requested explicitly by the client, then it falls back to this default.
+			The standard RFC explicitly define that this default must be IPv4, 
+			so use other option values with care!
 
 --cli-ip		Local system IP address to be used for CLI management interface.
 			The turnserver process can be accessed for management with telnet,
@@ -994,4 +1027,8 @@ https://groups.google.com/forum/?fromgroups=#!forum/turn-server-project-rfc5766-
 
 	Bradley T. Hughes <bradleythughes@fastmail.fm>
 
-        Mihaly Meszaros <misi@majd.eu>
+    Mihály Mészáros <misi@majd.eu>
+
+  ACTIVE MAINTAINERS
+
+	Mihály Mészáros <misi@majd.eu>
