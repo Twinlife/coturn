@@ -147,6 +147,49 @@ int turn_mutex_destroy(turn_mutex* mutex) {
 
 ///////////////////////// LOG ///////////////////////////////////
 
+/* syslog facility */
+/*BVB-594  Syslog facility */
+static char* str_fac[]={"LOG_AUTH","LOG_CRON","LOG_DAEMON",
+			"LOG_KERN","LOG_LOCAL0","LOG_LOCAL1",
+			"LOG_LOCAL2","LOG_LOCAL3","LOG_LOCAL4","LOG_LOCAL5",
+			"LOG_LOCAL6","LOG_LOCAL7","LOG_LPR","LOG_MAIL",
+			"LOG_NEWS","LOG_USER","LOG_UUCP",
+			"LOG_AUTHPRIV","LOG_SYSLOG",
+			0};
+
+static int int_fac[]={LOG_AUTH ,  LOG_CRON , LOG_DAEMON ,
+		    LOG_KERN , LOG_LOCAL0 , LOG_LOCAL1 ,
+		    LOG_LOCAL2 , LOG_LOCAL3 , LOG_LOCAL4 , LOG_LOCAL5 ,
+		    LOG_LOCAL6 , LOG_LOCAL7 , LOG_LPR , LOG_MAIL ,
+		    LOG_NEWS , LOG_USER , LOG_UUCP,
+		    LOG_AUTHPRIV,LOG_SYSLOG,
+		    0};
+
+static int syslog_facility = 0;
+
+static int str_to_syslog_facility(char *s)
+{
+	int i;
+	for (i=0; str_fac[i]; i++) {
+		if (!strcasecmp(s,str_fac[i]))
+			return int_fac[i];
+	}
+	return -1;
+}
+
+void set_syslog_facility(char *val)
+{
+	if(val == NULL){
+		return;
+	}
+	int tmp = str_to_syslog_facility(val);
+	if(tmp == -1){
+		TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "WARNING: invalid syslog-facility value (%s); ignored.\n", val);
+		return;
+	}
+	syslog_facility = tmp;
+}
+
 #if defined(TURN_LOG_FUNC_IMPL)
 extern void TURN_LOG_FUNC_IMPL(TURN_LOG_LEVEL level, const char* format, va_list args);
 #endif
@@ -496,7 +539,6 @@ void turn_log_func_default(TURN_LOG_LEVEL level, const char* format, ...)
 	/* Fix for Issue 24, raised by John Selbie: */
 #define MAX_RTPPRINTF_BUFFER_SIZE (1024)
 	char s[MAX_RTPPRINTF_BUFFER_SIZE+1];
-#undef MAX_RTPPRINTF_BUFFER_SIZE
 	size_t so_far = 0;
 	if (use_new_log_timestamp_format) {
 		time_t now = time(NULL);
@@ -506,11 +548,15 @@ void turn_log_func_default(TURN_LOG_LEVEL level, const char* format, ...)
 	}
 	so_far += snprintf(s + so_far, sizeof(s)-100, (level == TURN_LOG_LEVEL_ERROR) ? ": ERROR: " : ": ");
 	so_far += vsnprintf(s + so_far,sizeof(s) - (so_far+1), format, args);
+	if(so_far > MAX_RTPPRINTF_BUFFER_SIZE+1)
+	{
+		so_far=MAX_RTPPRINTF_BUFFER_SIZE+1;
+	}
 	if(!no_stdout_log)
 		fwrite(s, so_far, 1, stdout);
 	/* write to syslog or to log file */
 	if(to_syslog) {
-		syslog(get_syslog_level(level),"%s",s);
+		syslog(syslog_facility|get_syslog_level(level),"%s",s);
 	} else {
 		log_lock();
 		set_rtpfile();

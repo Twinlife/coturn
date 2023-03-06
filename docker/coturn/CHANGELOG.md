@@ -4,6 +4,88 @@ Coturn TURN server Docker image changelog
 
 
 
+## [4.6.0-r0] · 2022-08-13
+[4.6.0-r0]: /../../tree/docker/4.6.0-r0
+
+### Upgraded
+
+- [Coturn] 4.6.0: <https://github.com/coturn/coturn/blob/b7b43edd33c21caf18547243649272d2ada1d112/ChangeLog>
+
+### Security updated
+
+- [Debian Linux] "bullseye" 20220912: <https://github.com/docker-library/official-images/commit/80ce239c006d681e7687e1a73777126db94e9959>
+
+
+
+
+## [4.5.2-r14] · 2022-08-10
+[4.5.2-r14]: /../../tree/docker/4.5.2-r14
+
+### Security updated
+
+- [Alpine Linux] 3.16.2: <https://github.com/docker-library/official-images/commit/00214788d0150e2bcf2b2f51f786f92addef2478>
+- [Debian Linux] "bullseye" 20220801: <https://github.com/docker-library/official-images/commit/ce10f6b60289c0c0b5de6f785528b8725f225a58>
+
+
+
+
+## [4.5.2-r13] · 2022-07-19
+[4.5.2-r13]: /../../tree/docker/4.5.2-r13
+
+### Security updated
+
+- [Alpine Linux] 3.16.1: <https://github.com/docker-library/official-images/commit/dcc1108c96213d2f8cca14c23273526913312146>
+- [Debian Linux] "bullseye" 20220622: <https://github.com/docker-library/official-images/commit/979b8e278e5d921f1bfddf07d1ab56ab6bb9c3f9>
+
+
+
+
+## [4.5.2-r12] · 2022-05-24
+[4.5.2-r12]: /../../tree/docker/4.5.2-r12
+
+### Upgraded
+
+- [Alpine Linux] 3.16: <https://alpinelinux.org/posts/Alpine-3.16.0-released.html>
+
+### Security updated
+
+- [Debian Linux] "bullseye" 20220509: <https://github.com/docker-library/official-images/commit/5e2abb3fc26aa1e16e7e3516580621bef93a64e2>
+
+
+
+
+## [4.5.2-r11] · 2022-04-06
+[4.5.2-r11]: /../../tree/docker/4.5.2-r11
+
+### Security updated
+
+- [Alpine Linux] 3.15.4: <https://github.com/docker-library/official-images/commit/1c3c904f7310fa85d2efad018596cc040e00c018>
+
+
+
+
+## [4.5.2-r10] · 2022-03-29
+[4.5.2-r10]: /../../tree/docker/4.5.2-r10
+
+### Security updated
+
+- [Alpine Linux] 3.15.3: <https://github.com/docker-library/official-images/commit/e83c8d565978ce1edf1b7bb565484e8cb4419d24>
+- [Debian Linux] "bullseye" 20220328: <https://github.com/docker-library/official-images/commit/805cd38af6aec5e5a475c0229c6c1c9831af6124>
+
+
+
+
+## [4.5.2-r9] · 2022-03-25
+[4.5.2-r9]: /../../tree/docker/4.5.2-r9
+
+### Security updated
+
+- [Alpine Linux] 3.15.2: <https://github.com/docker-library/official-images/commit/72599f4196000032663a637e542cd23b4dc68936>
+- [Debian Linux] "bullseye" 20220316: <https://github.com/docker-library/official-images/commit/1e1bb99db26edc6b8605d83eefc22e1288203a20>
+
+
+
+
 ## [4.5.2-r8] · 2021-12-03
 [4.5.2-r8]: /../../tree/docker/4.5.2-r8
 

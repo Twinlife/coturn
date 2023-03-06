@@ -297,15 +297,15 @@ static stun_buffer_list_elem *new_blist_elem(ioa_engine_handle e)
 
 	if(!ret) {
 	  ret = (stun_buffer_list_elem *)malloc(sizeof(stun_buffer_list_elem));
-	  if (ret) {
-		ret->next = NULL;
-	  } else {
-		TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: Cannot allocate memory for STUN buffer!\n", __FUNCTION__);
-	  }
 	}
 
 	if(ret) {
-	  bzero(&ret->buf, sizeof(stun_buffer));
+	  ret->buf.len = 0;
+	  ret->buf.offset = 0;
+	  ret->buf.coffset = 0;
+	  ret->next = NULL;
+	} else {
+	  TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: Cannot allocate memory for STUN buffer!\n", __FUNCTION__);
 	}
 
 	return ret;
@@ -1428,6 +1428,7 @@ static void set_socket_ssl(ioa_socket_handle s, SSL *ssl)
 		if(ssl) {
 			SSL_set_app_data(ssl,s);
 			SSL_set_info_callback(ssl, (ssl_info_callback_t)ssl_info_callback);
+			SSL_set_options(ssl, SSL_OP_NO_RENEGOTIATION);
 		}
 	}
 }
@@ -1547,9 +1548,15 @@ void close_ioa_socket(ioa_socket_handle s)
 
 		close_socket_net_data(s);
 
-		s->session = NULL;
-		s->sub_session = NULL;
-		s->magic = 0;
+    if (s->session && s->session->client_socket == s) {
+      // Detaching client socket from super session to prevent mem corruption
+      // in case client_to_be_allocated_timeout_handler gets triggered
+      s->session->client_socket = NULL;
+    }
+
+    s->session = NULL;
+    s->sub_session = NULL;
+    s->magic = 0;
 
 		free(s);
 	}
@@ -1647,7 +1654,7 @@ ioa_socket_handle detach_ioa_socket(ioa_socket_handle s)
 		addr_cpy(&(ret->local_addr),&(s->local_addr));
 		ret->connected = s->connected;
 		addr_cpy(&(ret->remote_addr),&(s->remote_addr));
-		
+
 		delete_socket_from_map(s);
 		delete_socket_from_parent(s);
 
@@ -1833,7 +1840,7 @@ int ssl_read(evutil_socket_t fd, SSL* ssl, ioa_network_buffer_handle nbh, int ve
 	BIO* rbio = BIO_new_mem_buf(buffer, old_buffer_len);
 	BIO_set_mem_eof_return(rbio, -1);
 
-#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined LIBRESSL_VERSION_NUMBER
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || (defined LIBRESSL_VERSION_NUMBER && LIBRESSL_VERSION_NUMBER < 0x3040000fL)
 	ssl->rbio = rbio;
 #else
 	SSL_set0_rbio(ssl,rbio);
@@ -1928,7 +1935,7 @@ int ssl_read(evutil_socket_t fd, SSL* ssl, ioa_network_buffer_handle nbh, int ve
 	if(ret>0) {
 		ioa_network_buffer_add_offset_size(nbh, (uint16_t)buf_size, 0, (size_t)ret);
 	}
-#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined LIBRESSL_VERSION_NUMBER
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || (defined LIBRESSL_VERSION_NUMBER && LIBRESSL_VERSION_NUMBER < 0x3040000fL)
 	ssl->rbio = NULL;
 	BIO_free(rbio);
 #else
@@ -2757,8 +2764,8 @@ void close_ioa_socket_after_processing_if_necessary(ioa_socket_handle s)
 		{
 			tcp_connection *tc = s->sub_session;
 			if (tc) {
-				delete_tcp_connection(tc);
 				s->sub_session = NULL;
+				delete_tcp_connection(tc);
 			}
 		}
 			break;
@@ -2778,7 +2785,7 @@ void close_ioa_socket_after_processing_if_necessary(ioa_socket_handle s)
 
 static void socket_output_handler_bev(struct bufferevent *bev, void* arg)
 {
-	
+
 	UNUSED_ARG(bev);
 	UNUSED_ARG(arg);
 
@@ -2945,8 +2952,8 @@ static void eventcb_bev(struct bufferevent *bev, short events, void *arg)
 			{
 				tcp_connection *tc = s->sub_session;
 				if (tc) {
-					delete_tcp_connection(tc);
 					s->sub_session = NULL;
+					delete_tcp_connection(tc);
 				}
 			}
 				break;
@@ -3348,7 +3355,7 @@ int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr* dest_addr,
 							  char sto[129];
 							  addr_to_string(dest_addr, (uint8_t*)sto);
 							  TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
-									"%s: network error: address unreachable from %s to %s\n", 
+									"%s: network error: address unreachable from %s to %s\n",
 									__FUNCTION__,sfrom,sto);
 							}
 #endif
@@ -3720,8 +3727,21 @@ void turn_report_allocation_set(void *a, turn_time_t lifetime, int refresh)
 					} else {
 						snprintf(key,sizeof(key),"turn/user/%s/allocation/%018llu/status",(char*)ss->username, (unsigned long long)ss->id);
 					}
-					send_message_to_redis(e->rch, "set", key, "%s lifetime=%lu", status, (unsigned long)lifetime);
-					send_message_to_redis(e->rch, "publish", key, "%s lifetime=%lu", status, (unsigned long)lifetime);
+					uint8_t saddr[129];
+					uint8_t rsaddr[129];
+					addr_to_string(get_local_addr_from_ioa_socket(ss->client_socket), saddr);
+					addr_to_string(get_remote_addr_from_ioa_socket(ss->client_socket), rsaddr);
+					const char *type = socket_type_name(get_ioa_socket_type(ss->client_socket));
+					const char *ssl = ss->client_socket->ssl ? turn_get_ssl_method(ss->client_socket->ssl, "UNKNOWN") : "NONE";
+					const char *cipher = ss->client_socket->ssl ? get_ioa_socket_cipher(ss->client_socket) : "NONE";
+					send_message_to_redis(e->rch, "set", key, "%s lifetime=%lu, type=%s, local=%s, remote=%s, ssl=%s, cipher=%s", status, (unsigned long)lifetime, type, saddr, rsaddr, ssl, cipher);
+					send_message_to_redis(e->rch, "publish", key, "%s lifetime=%lu, type=%s, local=%s, remote=%s, ssl=%s, cipher=%s", status, (unsigned long)lifetime, type, saddr, rsaddr, ssl, cipher);
+				}
+#endif
+#if !defined(TURN_NO_PROMETHEUS)
+				{
+					if (!refresh)
+						prom_inc_allocation();
 				}
 #endif
 			}
@@ -3779,6 +3799,7 @@ void turn_report_allocation_delete(void *a)
 						prom_set_finished_traffic(NULL, (const char*)ss->username, (unsigned long)(ss->t_received_packets), (unsigned long)(ss->t_received_bytes), (unsigned long)(ss->t_sent_packets), (unsigned long)(ss->t_sent_bytes), false);
 						prom_set_finished_traffic(NULL, (const char*)ss->username, (unsigned long)(ss->t_peer_received_packets), (unsigned long)(ss->t_peer_received_bytes), (unsigned long)(ss->t_peer_sent_packets), (unsigned long)(ss->t_peer_sent_bytes), true);
 					}
+					prom_dec_allocation();
 				}
 #endif
 			}

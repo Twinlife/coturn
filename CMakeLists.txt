@@ -6,7 +6,7 @@ project(coturn)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_SOURCE_DIR}/cmake)
 # TODO: Modify this when the version is released
-SET(BUILD_VERSION "4.5.2")
+SET(BUILD_VERSION "4.6.1")
 
 # Find Git Version Patch
 IF(EXISTS "${CMAKE_SOURCE_DIR}/.git")
@@ -54,6 +54,10 @@ IF(MSVC)
     add_compile_options("$<$<C_COMPILER_ID:MSVC>:/utf-8>")
     add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
 ENDIF(MSVC)
+
+IF(APPLE)
+    add_compile_definitions("TURN_NO_THREAD_BARRIERS=1")
+ENDIF()
 
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)

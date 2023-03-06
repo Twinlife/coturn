@@ -173,6 +173,8 @@ TURN_CREDENTIALS_NONE, /* ct */
 0, /* user_quota */
 #if !defined(TURN_NO_PROMETHEUS)
 0, /* prometheus disabled by default */
+DEFAULT_PROM_SERVER_PORT, /* prometheus port */
+0, /* prometheus username labelling disabled by default when prometheus is enabled */
 #endif
 ///////////// Users DB //////////////
 { (TURN_USERDB_TYPE)0, {"\0"}, {0,NULL, {NULL,0}} },
@@ -557,8 +559,10 @@ static char Usage[] = "Usage: turnserver [options]\n"
 "						The connection string has the same parameters as redis-userdb connection string.\n"
 #endif
 #if !defined(TURN_NO_PROMETHEUS)
-" --prometheus					Enable prometheus metrics. It is disabled by default. If it is enabled it will listen on port 9641 unther the path /metrics\n"
+" --prometheus					Enable prometheus metrics. It is disabled by default. If it is enabled it will listen on port 9641 under the path /metrics\n"
 "						also the path / on this port can be used as a health check\n"
+" --prometheus-port		<port>		Prometheus metrics port (Default: 9641).\n"
+" --prometheus-username-labels			When metrics are enabled, add labels with client usernames.\n"
 #endif
 " --use-auth-secret				TURN REST API flag.\n"
 "						Flag that sets a special authorization option that is based upon authentication secret\n"
@@ -620,11 +624,12 @@ static char Usage[] = "Usage: turnserver [options]\n"
 "						a log file. With this option everything will be going to the log file only\n"
 "						(unless the log file itself is stdout).\n"
 " --syslog					Output all log information into the system log (syslog), do not use the file output.\n"
+" --syslog-facility             <value>          Set syslog facility for syslog messages. Default is ''.\n"
 " --simple-log					This flag means that no log file rollover will be used, and the log file\n"
 "						name will be constructed as-is, without PID and date appendage.\n"
 "						This option can be used, for example, together with the logrotate tool.\n"
 " --new-log-timestamp				Enable full ISO-8601 timestamp in all logs.\n"
-" --new-log-timestamp-format    	<format>	Set timestamp format (in strftime(1) format)\n"
+" --new-log-timestamp-format    	<format>	Set timestamp format (in strftime(1) format). Depends on --new-log-timestamp to be enabled.\n"
 " --log-binding					Log STUN binding request. It is now disabled by default to avoid DoS attacks.\n"
 " --stale-nonce[=<value>]			Use extra security with nonce value having limited lifetime (default 600 secs).\n"
 " --max-allocate-lifetime	<value>		Set the maximum value for the allocation lifetime. Default to 3600 secs.\n"
@@ -701,6 +706,7 @@ static char Usage[] = "Usage: turnserver [options]\n"
 " --no-stun-backward-compatibility		Disable handling old STUN Binding requests and disable MAPPED-ADDRESS attribute\n"
 "						in binding response (use only the XOR-MAPPED-ADDRESS).\n"
 " --response-origin-only-with-rfc5780		Only send RESPONSE-ORIGIN attribute in binding response if RFC5780 is enabled.\n"
+" --version					Print version (and exit).\n"
 " -h						Help\n"
 "\n";
 
@@ -787,6 +793,8 @@ enum EXTRA_OPTS {
 	CHANNEL_LIFETIME_OPT,
 	PERMISSION_LIFETIME_OPT,
 	PROMETHEUS_OPT,
+	PROMETHEUS_PORT_OPT,
+	PROMETHEUS_ENABLE_USERNAMES_OPT,
 	AUTH_SECRET_OPT,
 	NO_AUTH_PINGS_OPT,
 	NO_DYNAMIC_IP_LIST_OPT,
@@ -796,6 +804,7 @@ enum EXTRA_OPTS {
 	AUTH_SECRET_TS_EXP, /* deprecated */
 	NO_STDOUT_LOG_OPT,
 	SYSLOG_OPT,
+	SYSLOG_FACILITY_OPT,
 	SIMPLE_LOG_OPT,
 	NEW_LOG_TIMESTAMP_OPT,
 	NEW_LOG_TIMESTAMP_FORMAT_OPT,
@@ -849,7 +858,8 @@ enum EXTRA_OPTS {
 	LOG_BINDING_OPT,
 	NO_RFC5780,
 	NO_STUN_BACKWARD_COMPATIBILITY_OPT,
-	RESPONSE_ORIGIN_ONLY_WITH_RFC5780_OPT
+	RESPONSE_ORIGIN_ONLY_WITH_RFC5780_OPT,
+	VERSION_OPT
 };
 
 struct myoption {
@@ -902,6 +912,8 @@ static const struct myoption long_options[] = {
 #endif
 #if !defined(TURN_NO_PROMETHEUS)
 				{ "prometheus", optional_argument, NULL, PROMETHEUS_OPT },
+				{ "prometheus-port", optional_argument, NULL, PROMETHEUS_PORT_OPT },
+				{ "prometheus-username-labels", optional_argument, NULL, PROMETHEUS_ENABLE_USERNAMES_OPT },
 #endif
 				{ "use-auth-secret", optional_argument, NULL, AUTH_SECRET_OPT },
 				{ "static-auth-secret", required_argument, NULL, STATIC_AUTH_SECRET_VAL_OPT },
@@ -989,6 +1001,8 @@ static const struct myoption long_options[] = {
 				{ "no-rfc5780", optional_argument, NULL, NO_RFC5780 },
 				{ "no-stun-backward-compatibility", optional_argument, NULL, NO_STUN_BACKWARD_COMPATIBILITY_OPT },
 				{ "response-origin-only-with-rfc5780", optional_argument, NULL, RESPONSE_ORIGIN_ONLY_WITH_RFC5780_OPT },
+				{ "version", optional_argument, NULL, VERSION_OPT },
+				{ "syslog-facility", required_argument, NULL, SYSLOG_FACILITY_OPT },
 				{ NULL, no_argument, NULL, 0 }
 };
 
@@ -1534,6 +1548,12 @@ static void set_option(int c, char *value)
 	case PROMETHEUS_OPT:
 		turn_params.prometheus = 1;
 		break;
+	case PROMETHEUS_PORT_OPT:
+		turn_params.prometheus_port = atoi(value);
+		break;
+	case PROMETHEUS_ENABLE_USERNAMES_OPT:
+		turn_params.prometheus_username_labels = 1;
+		break;
 #endif
 	case AUTH_SECRET_OPT:
 		turn_params.use_auth_secret_with_timestamp = 1;
@@ -1679,6 +1699,7 @@ static void set_option(int c, char *value)
 	case SIMPLE_LOG_OPT:
 	case NEW_LOG_TIMESTAMP_OPT:
 	case NEW_LOG_TIMESTAMP_FORMAT_OPT:
+	case SYSLOG_FACILITY_OPT:
 	case 'c':
 	case 'n':
 	case 'h':
@@ -1757,7 +1778,10 @@ static void read_config_file(int argc, char **argv, int pass)
 				} else if (!strcmp(argv[i], "-h")) {
 					printf("\n%s\n",Usage);
 					exit(0);
-				}
+				} else if (!strcmp(argv[i], "--version")) {
+                    printf("%s\n",TURN_SERVER_VERSION);
+                    exit(0);
+                }
 			}
 		}
 	}
@@ -1809,6 +1833,8 @@ static void read_config_file(int argc, char **argv, int pass)
 						use_new_log_timestamp_format=1;
 					} else if ((pass==0) && (c==NEW_LOG_TIMESTAMP_FORMAT_OPT)) {
 						set_turn_log_timestamp_format(value);
+					} else if((pass==0) && (c==SYSLOG_FACILITY_OPT)) {
+						set_syslog_facility(value);	
 					} else if((pass == 1) && (c != 'u')) {
 						set_option(c, value);
 					} else if((pass == 2) && (c == 'u')) {
@@ -1825,7 +1851,7 @@ static void read_config_file(int argc, char **argv, int pass)
 
 		} else
 			TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "WARNING: Cannot find config file: %s. Default and command-line settings will be used.\n",
-					config_file);
+                          config_file);
 
 		if (full_path_to_config_file) {
 			free(full_path_to_config_file);
@@ -2295,6 +2321,9 @@ int main(int argc, char **argv)
 			case NEW_LOG_TIMESTAMP_FORMAT_OPT:
 				set_turn_log_timestamp_format(optarg);
 				break;
+			case SYSLOG_FACILITY_OPT:
+				set_syslog_facility(optarg);
+				break;				
 			default:
 				;
 			}
@@ -2428,7 +2457,7 @@ int main(int argc, char **argv)
 		}
         }
 
-	if(use_cli && cli_password[0]==0 && use_cli) {
+	if(use_cli && cli_password[0]==0) {
 		TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "\nCONFIG ERROR: Empty cli-password, and so telnet cli interface is disabled! Please set a non empty cli-password!\n");
 		use_cli = 0;
 	}
@@ -2730,8 +2759,7 @@ static void adjust_key_file_name(char *fn, const char* file_title, int critical)
 	  strncpy(fn,full_path_to_file,sizeof(turn_params.cert_file)-1);
 	  fn[sizeof(turn_params.cert_file)-1]=0;
 
-	  if(full_path_to_file)
-	    free(full_path_to_file);
+	  free(full_path_to_file);
 	  return;
 	}
 
