@@ -3086,7 +3086,7 @@ int udp_send(ioa_socket_handle s, const ioa_addr *dest_addr, const char *buffer,
 
     if (rc < 0) {
       // --twinlife-- 191024
-      if (socket_enobufs() || socket_eagain() || socket_eperm() {
+      if (socket_enobufs() || socket_eagain() || socket_eperm()) {
         // Lost packet due to overload or firewall drop... fine.
         // --twinlife-- 191024
         rc = len;
