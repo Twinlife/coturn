@@ -461,12 +461,12 @@ else
 	type install 2>>/dev/null
 	ER=$?
 	if [ ${ER} -eq 0 ] ; then
-		INSTALL_PROGRAM="install"
-		INSTALL_MAN="install"
-		INSTALL_SCRIPT="install"
-		INSTALL_SHARED_LIB="install"
-		INSTALL_STATIC_LIB="install"
-		INSTALL_DATA="install"
+		INSTALL_PROGRAM="install -p"
+		INSTALL_MAN="install -p -m 0644"
+		INSTALL_SCRIPT="install -p"
+		INSTALL_SHARED_LIB="install -p"
+		INSTALL_STATIC_LIB="install -p"
+		INSTALL_DATA="install -p"
 		MKDIR="install -d"
 	else
 		INSTALL_PROGRAM="cp -pf"
@@ -830,7 +830,7 @@ else
     else
         ${ECHO_CMD} "ERROR: Libevent2 development libraries are not installed properly in required location."
         ${ECHO_CMD} "ERROR: may be you have just too old libevent tool - then you have to upgrade it."
-        ${ECHO_CMD} "See the INSTALL file."
+        ${ECHO_CMD} "See the docs/Build.md file."
         ${ECHO_CMD} "Abort."
         cleanup
         exit 1
@@ -864,7 +864,7 @@ if [ -z "${TURN_NO_PROMETHEUS}" ] ; then
                 ${ECHO_CMD}
                 ${ECHO_CMD} "Warning: microhttpd development libraries are not installed properly in required location."
                 ${ECHO_CMD} "Prometheus support will be disabled."
-                ${ECHO_CMD} "See the INSTALL file."
+                ${ECHO_CMD} "See the docs/Build.md file."
                 ${ECHO_CMD}
                 OSCFLAGS="${OSCFLAGS} -DTURN_NO_PROMETHEUS"
             fi
@@ -872,7 +872,7 @@ if [ -z "${TURN_NO_PROMETHEUS}" ] ; then
             ${ECHO_CMD}
             ${ECHO_CMD} "Warning: Libpromhttp development libraries are not installed properly in required location."
             ${ECHO_CMD} "Prometheus support will be disabled."
-            ${ECHO_CMD} "See the INSTALL file."
+            ${ECHO_CMD} "See the docs/Build.md file."
             ${ECHO_CMD}
             OSCFLAGS="${OSCFLAGS} -DTURN_NO_PROMETHEUS"
         fi
@@ -880,7 +880,7 @@ if [ -z "${TURN_NO_PROMETHEUS}" ] ; then
         ${ECHO_CMD}
         ${ECHO_CMD} "Warning: Libprom development libraries are not installed properly in required location."
         ${ECHO_CMD} "Prometheus support will be disabled."
-        ${ECHO_CMD} "See the INSTALL file."
+        ${ECHO_CMD} "See the docs/Build.md file."
         ${ECHO_CMD}
         OSCFLAGS="${OSCFLAGS} -DTURN_NO_PROMETHEUS"
     fi
@@ -1015,6 +1015,8 @@ if [ -z "${TURN_NO_SCTP}" ] ; then
     if [ -z "${TURN_SCTP_INCLUDE}" ] ; then
 		if [ -f /usr/include/netinet/sctp.h ] ; then
 	    	TURN_SCTP_INCLUDE="-DTURN_SCTP_INCLUDE=\"</usr/include/netinet/sctp.h>\""
+		else
+	    	TURN_NO_SCTP="-DTURN_NO_SCTP"
 		fi
     else
 		TURN_SCTP_INCLUDE="-DTURN_SCTP_INCLUDE=\"\\\"${TURN_SCTP_INCLUDE}\\\"\""

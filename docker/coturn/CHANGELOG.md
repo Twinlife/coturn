@@ -4,6 +4,69 @@ Coturn TURN server Docker image changelog
 
 
 
+## [4.6.1-r3] · 2023-03-31
+[4.6.1-r3]: /../../tree/docker/4.6.1-r3
+
+### Security updated
+
+- [Alpine Linux] 3.16.5: <https://github.com/docker-library/official-images/commit/d5e1db947991b391f375ef1e8686b884538c1917>
+- [Debian Linux] "bullseye" 20230320: <https://github.com/docker-library/official-images/commit/066bc3b863f98325ff211a27301fe1b5a5d51721>
+
+
+
+
+## [4.6.1-r2] · 2023-02-13
+[4.6.1-r2]: /../../tree/docker/4.6.1-r2
+
+### Security updated
+
+- [Alpine Linux] 3.16.4: <https://github.com/docker-library/official-images/commit/5819aa56167e9874ef65e35da8277dc71b3ecee6>
+- [Debian Linux] "bullseye" 20230208: <https://github.com/docker-library/official-images/commit/0a379d1f4d38dee47df84b07afcf5c26d03cc5a5>
+
+
+
+
+## [4.6.1-r1] · 2023-01-31
+[4.6.1-r1]: /../../tree/docker/4.6.1-r1
+
+### Fixed
+
+- Incorrect argument expansion in `docker-entrypoint.sh`. ([#1110])
+
+### Security updated
+
+- [Debian Linux] "bullseye" 20230109: <https://github.com/docker-library/official-images/commit/5e4784af91b60ebae23aab567b6cea3dcdb173a0>
+
+[#1110]: /../../pull/1110
+
+
+
+
+## [4.6.1-r0] · 2022-12-04
+[4.6.1-r0]: /../../tree/docker/4.6.1-r0
+
+### Upgraded
+
+- [Coturn] 4.6.1: <https://github.com/coturn/coturn/blob/491b231f80471e63d3f5f3e967a9367e508b2da5/ChangeLog>
+
+
+
+
+## [4.6.0-r1] · 2022-11-16
+[4.6.0-r1]: /../../tree/docker/4.6.0-r1
+
+### Added
+
+- Support of `linux/386` platform.
+
+### Security updated
+
+- [Alpine Linux] 3.16.3: <https://github.com/docker-library/official-images/commit/bbdc5719dd50a7d4c112b517b5bd6d7f8d35ceff>
+- [Debian Linux] "bullseye" 20221114: <https://github.com/docker-library/official-images/commit/629455d056a9b046c12d4fa65a1006d4b94b5fa5>
+
+
+
+
 ## [4.6.0-r0] · 2022-08-13
 [4.6.0-r0]: /../../tree/docker/4.6.0-r0
 
@@ -167,7 +230,7 @@ Coturn TURN server Docker image changelog
 
 ### Improved
 
-- Use DNS requests to discover external IP address in `detect-external-ip` script ([#753]).
+- Use DNS requests to discover external IP address in `detect-external-ip` script. ([#753])
 
 ### Fixed
 
@@ -195,7 +258,6 @@ Coturn TURN server Docker image changelog
     - `linux/arm/v7`
     - `linux/ppc64le`
     - `linux/s390x`
-
 
 
 
