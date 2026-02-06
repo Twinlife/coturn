@@ -2,7 +2,7 @@
 # Dockerfile of coturn/coturn:debian Docker image.
 #
 
-ARG debian_ver=bullseye
+ARG debian_ver=trixie
 
 
 
@@ -46,27 +46,13 @@ RUN mkdir -p /build/prom/build/ && cd /build/prom/build/ \
                  .. \
  && make
 
-# Build libpromhttp.so from sources.
-RUN mkdir -p /build/promhttp/build/ && cd /build/promhttp/build/ \
- # Fix compiler warning: -Werror=incompatible-pointer-types
- && sed -i 's/\&promhttp_handler/(MHD_AccessHandlerCallback)\&promhttp_handler/' \
-           /build/promhttp/src/promhttp.c \
- && TEST=0 cmake -G "Unix Makefiles" \
-                 -DCMAKE_INSTALL_PREFIX=/usr \
-                 -DCMAKE_SKIP_BUILD_RPATH=TRUE \
-                 -DCMAKE_C_FLAGS="-g -O3" \
-                 .. \
- && make VERBOSE=1
-
 # Install prometheus-client-c.
 RUN LIBS_DIR=/out/$(dirname $(find /usr/ -name libc.so)) \
  && mkdir -p $LIBS_DIR/ \
  && cp -rf /build/prom/build/libprom.so \
-           /build/promhttp/build/libpromhttp.so \
        $LIBS_DIR/ \
  && mkdir -p /out/usr/include/ \
  && cp -rf /build/prom/include/* \
-           /build/promhttp/include/* \
        /out/usr/include/ \
  # Preserve license file.
  && mkdir -p /out/usr/share/licenses/prometheus-client-c/ \
@@ -181,13 +167,13 @@ RUN apt-get update \
  # Install Coturn dependencies.
  && apt-get install -y --no-install-recommends --no-install-suggests \
             libatomic1 \
-            libevent-2.1-7 libevent-core-2.1-7 libevent-extra-2.1-7 \
-            libevent-openssl-2.1-7 libevent-pthreads-2.1-7 \
-            libssl1.1 \
+            libevent-2.1-7t64 libevent-core-2.1-7t64 libevent-extra-2.1-7t64 \
+            libevent-openssl-2.1-7t64 libevent-pthreads-2.1-7t64 \
+            libssl3t64 \
             libpq5 libmariadb3 libsqlite3-0 \
-            libhiredis0.14 \
-            libmongoc-1.0-0 \
-            libmicrohttpd12 \
+            libhiredis1.1.0 \
+            libmongoc-1.0-0t64 \
+            libmicrohttpd12t64 \
  # Install `dig` tool for `detect-external-ip.sh`.
  && apt-get install -y --no-install-recommends --no-install-suggests \
             dnsutils \

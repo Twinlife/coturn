@@ -1,4 +1,8 @@
 /*
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * https://opensource.org/license/bsd-3-clause
+ *
  * Copyright (C) 2011, 2012, 2013 Citrix Systems
  *
  * All rights reserved.
@@ -29,13 +33,13 @@
  */
 
 #include "apputils.h"
+#include "ns_turn_defs.h" // for NULL, STRCPY
 #include "ns_turn_utils.h"
 #include "udpserver.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #if defined(_MSC_VER)
 #include <getopt.h>
 #else
@@ -61,8 +65,9 @@ int main(int argc, char **argv) {
   int c;
   char ifname[1025] = "\0";
 
-  if (socket_init())
+  if (socket_init()) {
     return -1;
+  }
 
   IS_TURN_SERVER = 1;
 
@@ -70,7 +75,7 @@ int main(int argc, char **argv) {
   set_no_stdout_log(1);
   set_system_parameters(0);
 
-  while ((c = getopt(argc, argv, "d:p:L:v")) != -1)
+  while ((c = getopt(argc, argv, "d:p:L:v")) != -1) {
     switch (c) {
     case 'd':
       STRCPY(ifname, optarg);
@@ -89,6 +94,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "%s\n", Usage);
       exit(1);
     }
+  }
 
   if (las < 1) {
     local_addr_list = (char **)realloc(local_addr_list, ++las * sizeof(char *));

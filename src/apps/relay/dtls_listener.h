@@ -1,4 +1,8 @@
 /*
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * https://opensource.org/license/bsd-3-clause
+ *
  * Copyright (C) 2011, 2012, 2013 Citrix Systems
  *
  * All rights reserved.
@@ -55,8 +59,8 @@ void setup_dtls_callbacks(SSL_CTX *ctx);
 #endif
 
 dtls_listener_relay_server_type *create_dtls_listener_server(const char *ifname, const char *local_address, int port,
-                                                             int verbose, ioa_engine_handle e, turn_turnserver *ts,
-                                                             int report_creation,
+                                                             int sock_buf_size, int verbose, ioa_engine_handle e,
+                                                             turn_turnserver *ts, int report_creation,
                                                              ioa_engine_new_connection_event_handler send_socket);
 
 void udp_send_message(dtls_listener_relay_server_type *server, ioa_network_buffer_handle nbh, ioa_addr *dest);

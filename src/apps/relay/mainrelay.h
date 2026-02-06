@@ -1,4 +1,8 @@
 /*
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * https://opensource.org/license/bsd-3-clause
+ *
  * Copyright (C) 2011, 2012, 2013 Citrix Systems
  *
  * All rights reserved.
@@ -28,10 +32,11 @@
  * SUCH DAMAGE.
  */
 
-#if !defined(__MAIN_RELAY__)
+#ifndef __MAIN_RELAY__
 #define __MAIN_RELAY__
 
 #include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,7 +54,7 @@
 
 #include <getopt.h>
 
-#if defined(__unix__) || defined(unix) || defined(__APPLE__) || defined(__DARWIN__) || defined(__MACH__)
+#if defined(__unix__) || defined(unix) || defined(__APPLE__)
 #include <ifaddrs.h>
 #include <libgen.h>
 #include <sys/resource.h>
@@ -86,9 +91,7 @@
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
 #include <openssl/modes.h>
-#endif
 
 #if !defined(TURN_NO_SYSTEMD)
 #include <systemd/sd-daemon.h>
@@ -98,21 +101,29 @@
 extern "C" {
 #endif
 
+#ifdef _MSC_VER
+extern volatile
+#else
+#include <stdatomic.h>
+extern _Atomic
+#endif
+    size_t global_allocation_count; // used for drain mode, to know when all allocations have gone away
+
 ////////////// DEFINES ////////////////////////////
 
 #define DEFAULT_CONFIG_FILE "turnserver.conf"
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
 #define DEFAULT_CIPHER_LIST OSSL_default_cipher_list()
-#if TLSv1_3_SUPPORTED
+#if TLS_SUPPORTED
 #define DEFAULT_CIPHERSUITES OSSL_default_ciphersuites()
 #endif
-#else
+#else // OPENSSL_VERSION_NUMBER < 0x30000000L
 #define DEFAULT_CIPHER_LIST "DEFAULT"
-#if TLSv1_3_SUPPORTED
+#if TLS_SUPPORTED && defined(TLS_DEFAULT_CIPHERSUITES)
 #define DEFAULT_CIPHERSUITES TLS_DEFAULT_CIPHERSUITES
 #endif
-#endif
+#endif // OPENSSL_VERSION_NUMBER >= 0x30000000L
 
 #define DEFAULT_EC_CURVE_NAME "prime256v1"
 
@@ -192,14 +203,15 @@ typedef struct _turn_params_ {
   char ca_cert_file[1025];
   char cert_file[1025];
   char pkey_file[1025];
+  bool rpk_enabled;
   char tls_password[513];
   char dh_file[1025];
 
-  int no_tlsv1;
-  int no_tlsv1_1;
-  int no_tlsv1_2;
-  int no_tls;
-  int no_dtls;
+  bool enable_tlsv1;
+  bool enable_tlsv1_1;
+  bool no_tlsv1_2;
+  bool no_tls;
+  bool no_dtls;
 
   struct event *tls_ctx_update_ev;
   TURN_MUTEX_DECLARE(tls_mutex)
@@ -207,11 +219,11 @@ typedef struct _turn_params_ {
   //////////////// Common params ////////////////////
 
   int verbose;
-  int turn_daemon;
-  int no_software_attribute;
-  int web_admin_listen_on_workers;
+  bool turn_daemon;
+  bool software_attribute;
+  bool web_admin_listen_on_workers;
 
-  int do_not_use_config_file;
+  bool do_not_use_config_file;
 
   char pidfile[1025];
   char acme_redirect[1025];
@@ -223,19 +235,19 @@ typedef struct _turn_params_ {
   int alt_listener_port;
   int alt_tls_listener_port;
   int tcp_proxy_port;
-  int rfc5780;
+  bool rfc5780;
 
-  int no_udp;
-  int no_tcp;
-  int tcp_use_proxy;
+  bool no_udp;
+  bool no_tcp;
+  bool tcp_use_proxy;
 
-  vint no_tcp_relay;
-  vint no_udp_relay;
+  bool no_tcp_relay;
+  bool no_udp_relay;
 
   char listener_ifname[1025];
 
   redis_stats_db_t redis_statsdb;
-  int use_redis_statsdb;
+  bool use_redis_statsdb;
 
   struct listener_server listener;
 
@@ -250,10 +262,10 @@ typedef struct _turn_params_ {
   uint16_t min_port;
   uint16_t max_port;
 
-  vint check_origin;
+  bool check_origin;
 
-  vint no_multicast_peers;
-  vint allow_loopback_peers;
+  bool no_multicast_peers;
+  bool allow_loopback_peers;
 
   char relay_ifname[1025];
   size_t relays_number;
@@ -267,6 +279,8 @@ typedef struct _turn_params_ {
 
   turnserver_id general_relay_servers_number;
   turnserver_id udp_relay_servers_number;
+
+  int sock_buf_size;
 
   ////////////// Auth server ////////////////
 
@@ -284,14 +298,16 @@ typedef struct _turn_params_ {
   turn_server_addrs_list_t alternate_servers_list;
   turn_server_addrs_list_t tls_alternate_servers_list;
 
+  /////////////// stop/drain server ////////////////
+  bool drain_turn_server;
   /////////////// stop server ////////////////
-  int stop_turn_server;
+  bool stop_turn_server;
 
   ////////////// MISC PARAMS ////////////////
 
-  vint stun_only;
-  vint no_stun;
-  vint secure_stun;
+  bool stun_only;
+  bool no_stun;
+  bool secure_stun;
   int server_relay;
   int fingerprint;
   char rest_api_separator;
@@ -299,17 +315,19 @@ typedef struct _turn_params_ {
   vint max_allocate_lifetime;
   vint channel_lifetime;
   vint permission_lifetime;
-  vint mobility;
+  bool mobility;
   turn_credential_type ct;
-  int use_auth_secret_with_timestamp;
+  bool use_auth_secret_with_timestamp;
   band_limit_t max_bps;
   band_limit_t bps_capacity;
   band_limit_t bps_capacity_allocated;
   vint total_quota;
   vint user_quota;
-  int prometheus;
+  bool prometheus;
   int prometheus_port;
-  int prometheus_username_labels;
+  char prometheus_address[INET6_ADDRSTRLEN];
+  char prometheus_path[1025];
+  bool prometheus_username_labels;
 
   /////// Users DB ///////////
 
@@ -318,18 +336,21 @@ typedef struct _turn_params_ {
   /////// CPUs //////////////
 
   unsigned long cpus;
+  bool cpus_configured;
 
   ///////// Encryption /////////
   char secret_key_file[1025];
   unsigned char secret_key[1025];
   ALLOCATION_DEFAULT_ADDRESS_FAMILY allocation_default_address_family;
-  int no_auth_pings;
-  int no_dynamic_ip_list;
-  int no_dynamic_realms;
+  bool no_auth_pings;
+  bool no_dynamic_ip_list;
+  bool no_dynamic_realms;
 
-  vint log_binding;
-  vint no_stun_backward_compatibility;
-  vint response_origin_only_with_rfc5780;
+  bool log_binding;
+  bool stun_backward_compatibility;
+  bool respond_http_unsupported;
+  bool drop_invalid_packets;
+  bool drop_invalid_packets_log;
 } turn_params_t;
 
 extern turn_params_t turn_params;
@@ -337,14 +358,16 @@ extern turn_params_t turn_params;
 ////////////////  Listener server /////////////////
 
 static inline int get_alt_listener_port(void) {
-  if (turn_params.alt_listener_port < 1)
+  if (turn_params.alt_listener_port < 1) {
     return turn_params.listener_port + 1;
+  }
   return turn_params.alt_listener_port;
 }
 
 static inline int get_alt_tls_listener_port(void) {
-  if (turn_params.alt_tls_listener_port < 1)
+  if (turn_params.alt_tls_listener_port < 1) {
     return turn_params.tls_listener_port + 1;
+  }
   return turn_params.alt_tls_listener_port;
 }
 
@@ -372,6 +395,7 @@ void send_auth_message_to_auth_server(struct auth_message *am);
 void init_listener(void);
 void setup_server(void);
 void run_listener_server(struct listener_server *ls);
+void enable_drain_mode(void);
 
 ////////// BPS ////////////////
 
@@ -388,7 +412,6 @@ struct ctr_state {
   unsigned int num;
   unsigned char ecount[16];
 };
-void generate_aes_128_key(char *filePath, unsigned char *returnedKey);
 unsigned char *base64encode(const void *b64_encode_this, int encode_this_many_bytes);
 void encrypt_aes_128(unsigned char *in, const unsigned char *mykey);
 unsigned char *base64decode(const void *b64_decode_this, int decode_this_many_bytes);
@@ -398,6 +421,9 @@ char *decryptPassword(char *in, const unsigned char *mykey);
 int init_ctr(struct ctr_state *state, const unsigned char iv[8]);
 
 ///////////////////////////////
+
+void increment_global_allocation_count(void);
+void decrement_global_allocation_count(void);
 
 #ifdef __cplusplus
 }

@@ -1,4 +1,8 @@
 /*
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * https://opensource.org/license/bsd-3-clause
+ *
  * Copyright (C) 2011, 2012, 2013 Citrix Systems
  *
  * All rights reserved.
@@ -175,7 +179,6 @@ struct turn_session_info {
   band_limit_t bps;
 };
 
-void turn_session_info_init(struct turn_session_info *tsi);
 void turn_session_info_clean(struct turn_session_info *tsi);
 void turn_session_info_add_peer(struct turn_session_info *tsi, ioa_addr *peer);
 

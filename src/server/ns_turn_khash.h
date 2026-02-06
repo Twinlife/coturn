@@ -1,5 +1,9 @@
 /* The MIT License
 
+   SPDX-License-Identifier: MIT
+
+   https://opensource.org/license/mit
+
    Copyright (c) 2008, 2009, 2011 by Attractive Chaos <attractor@live.co.uk>
 
    Permission is hereby granted, free of charge, to any person obtaining
@@ -426,9 +430,11 @@ static const double __ac_HASH_UPPER = 0.77;
  */
 static kh_inline khint_t __ac_X31_hash_string(const char *s) {
   khint_t h = (khint_t)*s;
-  if (h)
-    for (++s; *s; ++s)
+  if (h) {
+    for (++s; *s; ++s) {
       h = (h << 5) - h + (khint_t)*s;
+    }
+  }
   return h;
 }
 /*! @function
