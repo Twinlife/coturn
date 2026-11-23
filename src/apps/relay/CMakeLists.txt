@@ -52,7 +52,9 @@ set(HEADER_FILES
     ns_ioalib_impl.h
     ns_sm.h
     turn_ports.h
+    turn_dtls_half_open.h
     userdb.h
+    mp_peer_table.h
     dbdrivers/dbdriver.h
     prom_server.h
     dbdrivers/dbd_redis.h
@@ -66,8 +68,11 @@ set(SOURCE_FILES
     tls_listener.c
     dtls_listener.c
     ns_ioalib_engine_impl.c
+    turn_dtls_half_open.c
+    mp_peer_table.c
     turn_ports.c
     http_server.c
+    http_buffer.c
     acme.c
     userdb.c
     dbdrivers/dbdriver.c
@@ -130,8 +135,14 @@ endif()
 pkg_check_modules(HIREDIS IMPORTED_TARGET hiredis)
 if(HIREDIS_FOUND)
     list(APPEND turnserver_LIBS PkgConfig::HIREDIS)
-    list(APPEND SOURCE_FILES hiredis_libevent2.c dbdrivers/dbd_redis.c)
-    list(APPEND HEADER_FILES hiredis_libevent2.h dbdrivers/dbd_redis.h)
+    list(APPEND SOURCE_FILES hiredis_libevent2.c dbdrivers/dbd_redis.c dbdrivers/dbd_redis_conninfo.c)
+    list(APPEND HEADER_FILES hiredis_libevent2.h dbdrivers/dbd_redis.h dbdrivers/dbd_redis_conninfo.h)
+    # Optional TLS transport to Redis, provided by the separate hiredis_ssl library.
+    pkg_check_modules(HIREDIS_SSL IMPORTED_TARGET hiredis_ssl)
+    if(HIREDIS_SSL_FOUND)
+        list(APPEND turnserver_LIBS PkgConfig::HIREDIS_SSL)
+        list(APPEND turnserver_DEFINED TURN_HAVE_HIREDIS_SSL)
+    endif()
 else()
     list(APPEND turnserver_DEFINED TURN_NO_HIREDIS)
 endif()
@@ -145,15 +156,29 @@ else()
     list(APPEND turnserver_DEFINED TURN_NO_SYSTEMD)
 endif()
 
-find_package(Prometheus)
-if(Prometheus_FOUND)
-    list(APPEND turnserver_LIBS ${Prometheus_LIBRARIES})
-    list(APPEND turnserver_include_dirs ${Prometheus_INCLUDE_DIRS})
-else()
-    message(AUTHOR_WARNING "Could not find prometheus. Please install "
-        "prom, microhttpd, and set Prometheus_ROOT. "
-        "See docs/Prometheus.md")
+# Prometheus exporter.
+#
+# coturn ships a minimal, self-contained Prometheus client under
+# src/prometheus and builds it straight from these sources. The exporter is
+# always compiled in; the runtime --prometheus flag controls whether it is
+# actually started. libmicrohttpd serves the /metrics endpoint and is a
+# required build dependency (provided by vcpkg on Windows) -- except in the
+# fuzzing build (FUZZER), whose image has no libmicrohttpd and no use for the
+# metrics endpoint.
+find_package(MicroHTTPD)
+if(MicroHTTPD_FOUND)
+    list(APPEND SOURCE_FILES ${CMAKE_SOURCE_DIR}/src/prometheus/prom.c)
+    list(APPEND HEADER_FILES ${CMAKE_SOURCE_DIR}/src/prometheus/prom.h)
+    list(APPEND turnserver_LIBS ${MicroHTTPD_LIBRARIES})
+    list(APPEND turnserver_include_dirs
+        ${CMAKE_SOURCE_DIR}/src/prometheus
+        ${MicroHTTPD_INCLUDE_DIRS})
+elseif(FUZZER)
+    message(STATUS "libmicrohttpd not found; building fuzzing targets without the Prometheus exporter")
     list(APPEND turnserver_DEFINED TURN_NO_PROMETHEUS)
+else()
+    message(FATAL_ERROR "libmicrohttpd not found. Install libmicrohttpd-dev "
+        "(or set MicroHTTPD_ROOT). See docs/Prometheus.md")
 endif()
 
 list(APPEND turnserver_DEFINED TURN_NO_SCTP)
@@ -177,6 +202,7 @@ install(DIRECTORY
         $<TARGET_FILE_DIR:${PROJECT_NAME}>/
     DESTINATION DESTINATION "${CMAKE_INSTALL_BINDIR}"
         COMPONENT Runtime
+        USE_SOURCE_PERMISSIONS
     )
 
 if(WIN32)
@@ -190,7 +216,7 @@ if(WIN32)
 else()
     add_custom_target(turnadmin ALL
         COMMAND
-            ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE:${PROJECT_NAME}> $<TARGET_FILE_DIR:${PROJECT_NAME}>/turnadmin
+            ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:${PROJECT_NAME}> $<TARGET_FILE_DIR:${PROJECT_NAME}>/turnadmin
         DEPENDS ${PROJECT_NAME})
     INSTALL(FILES $<TARGET_FILE_DIR:${PROJECT_NAME}>/turnadmin
         DESTINATION "${CMAKE_INSTALL_BINDIR}"

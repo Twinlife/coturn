@@ -41,7 +41,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_SOURCE_DIR}/cmake)
 # TODO: Modify this when the version is released
-SET(BUILD_VERSION "4.8.0")
+SET(BUILD_VERSION "4.19.2")
 
 # Find Git Version Patch
 IF(EXISTS "${CMAKE_SOURCE_DIR}/.git")
@@ -75,15 +75,26 @@ endif()
 message("BUILD_VERSION:${BUILD_VERSION};${_BUILD_VERSION}")
 set(VERSION ${BUILD_VERSION})
 
-if(NOT DEFINED CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE "Release")
-endif(NOT DEFINED CMAKE_BUILD_TYPE)
+option(FUZZER "Build oss-fuzz fuzzing" OFF)
+
+# `project()` already defines CMAKE_BUILD_TYPE as an empty string, so test the
+# value rather than DEFINED -- otherwise an unspecified build type silently
+# compiles at -O0. Fuzzer builds take their -O/-fsanitize flags from the
+# OSS-Fuzz CFLAGS environment and must not be overridden.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES AND NOT FUZZER)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING
+        "Build type: Debug, Release, RelWithDebInfo or MinSizeRel" FORCE)
+endif()
 string(TOLOWER "${CMAKE_BUILD_TYPE}" build_type)
 if("debug" STREQUAL build_type)
     add_definitions(-D_DEBUG)
 endif()
 if(DEFINED TURN_SERVER_BUILD_INFO)
     add_definitions(-DTURN_SERVER_BUILD_INFO=${TURN_SERVER_BUILD_INFO})
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_definitions(-D_GNU_SOURCE)
 endif()
 
 IF(MSVC)
@@ -170,12 +181,17 @@ install(DIRECTORY
     )
 include(cmake/CMakeCPack.cmake)
 
-option(FUZZER "Build oss-fuzz fuzzing" OFF)
 if(FUZZER)
-    if (NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    if (NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
         message(FATAL_ERROR "clang is require for libFuzzer")
     endif()
 
     add_subdirectory(fuzzing)
 
+endif()
+
+option(BUILD_TESTING "Build unit tests" OFF)
+if(BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(tests)
 endif()

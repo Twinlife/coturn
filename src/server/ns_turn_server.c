@@ -37,7 +37,9 @@
 #include "../apps/relay/ns_ioalib_impl.h"
 #include "ns_turn_allocation.h"
 #include "ns_turn_ioalib.h"
+#include "ns_turn_maps.h"
 #include "ns_turn_msg_defs.h" // for STUN_ATTRIBUTE_NONCE
+#include "ns_turn_ratelimit.h"
 #include "ns_turn_utils.h"
 
 #include "apputils.h" // for turn_random, base64_decode
@@ -46,6 +48,8 @@
 #include <stdio.h>   // for snprintf
 #include <stdlib.h>  // for free, malloc, calloc, realloc
 #include <string.h>  // for memcpy, strlen, strcmp
+
+#include <openssl/sha.h>
 
 ///////////////////////////////////////////
 
@@ -77,6 +81,48 @@ static inline int get_family(int stun_family, ioa_engine_handle e, ioa_socket_ha
   };
 }
 
+/* A token's limit is an absolute time, not a duration to grant again on Refresh. */
+static turn_time_t oauth_remaining_lifetime(const ts_ur_super_session *ss) {
+  if (!ss->oauth) {
+    return 0;
+  }
+  const uint64_t now = (uint64_t)time(NULL);
+  if (ss->oauth_expiration_time <= now) {
+    return 0;
+  }
+  const uint64_t remaining = ss->oauth_expiration_time - now;
+  return remaining > UINT32_MAX ? UINT32_MAX : (turn_time_t)remaining;
+}
+
+static bool oauth_token_hash(ioa_network_buffer_handle nbh, uint8_t hash[SHA256_DIGEST_LENGTH]) {
+  stun_attr_ref token = stun_attr_get_first_covered_by_type_str(
+      ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh), STUN_ATTRIBUTE_OAUTH_ACCESS_TOKEN);
+  if (!token || stun_attr_get_len(token) <= 0) {
+    return false;
+  }
+  return SHA256(stun_attr_get_value(token), (size_t)stun_attr_get_len(token), hash) != NULL;
+}
+
+static bool oauth_lookup_matches_request(const ts_ur_super_session *ss, const stun_tid *tid,
+                                         ioa_network_buffer_handle nbh) {
+  uint8_t hash[SHA256_DIGEST_LENGTH] = {0};
+  return ss->oauth_lookup_done && stun_tid_equals(&ss->oauth_lookup_tid, tid) && oauth_token_hash(nbh, hash) &&
+         memcmp(ss->oauth_lookup_token_hash, hash, sizeof(hash)) == 0;
+}
+
+/* RFC 8656 Section 3: XOR-RELAYED-ADDRESS carries the relayed transport address,
+ * an address on the server itself. An external IP of a different family is not
+ * that address, so it can only stand in for a relay of its own family. */
+static void turn_set_xor_relayed_addr(turn_turnserver *server, ioa_addr *xor_relayed_addr,
+                                      const ioa_addr *relayed_addr) {
+  if (server->external_ip_set && (server->external_ip.ss.sa_family == relayed_addr->ss.sa_family)) {
+    addr_cpy(xor_relayed_addr, &(server->external_ip));
+    addr_set_port(xor_relayed_addr, addr_get_port(relayed_addr));
+  } else {
+    addr_cpy(xor_relayed_addr, relayed_addr);
+  }
+}
+
 ////////////////////////////////////////////////
 
 const char *get_version(turn_turnserver *server) {
@@ -97,10 +143,18 @@ static void maybe_add_software_attribute(turn_turnserver *server, ioa_network_bu
   }
 }
 
-#define MAX_NUMBER_OF_UNKNOWN_ATTRS (128)
+/* An OAuth session is keyed by its token's 160-bit mac_key; get_user_key() rejects any other length. */
+static size_t turn_session_hmackey_size(const turn_turnserver *server, const ts_ur_super_session *ss) {
+  if (ss->oauth) {
+    return turn_oauth_hmackey_size(SHA1SIZEBYTES, SHATYPE_DEFAULT,
+                                   server->oauth_legacy_mac_key && *(server->oauth_legacy_mac_key));
+  }
+  return get_hmackey_size(SHATYPE_DEFAULT);
+}
 
 int TURN_MAX_ALLOCATE_TIMEOUT = 60;
 int TURN_MAX_ALLOCATE_TIMEOUT_STUN_ONLY = 3;
+int TURN_DTLS_HALF_OPEN_TIMEOUT = 10;
 
 static inline void log_method(ts_ur_super_session *ss, const char *method, int err_code, const uint8_t *reason) {
   if (ss) {
@@ -110,28 +164,29 @@ static inline void log_method(ts_ur_super_session *ss, const char *method, int e
     if (!err_code) {
       if (ss->origin[0]) {
         TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
-                      "session %018llu: origin <%s> realm <%s> user <%s>: incoming packet %s processed, success\n",
-                      (unsigned long long)(ss->id), (const char *)(ss->origin), (const char *)(ss->realm_options.name),
-                      (const char *)(ss->username), method);
+                      "origin <%s> realm <%s> user <%s>: incoming packet %s processed, success (session %018llu)\n",
+                      (const char *)(ss->origin), (const char *)(ss->realm_options.name), (const char *)(ss->username),
+                      method, (unsigned long long)(ss->id));
       } else {
         TURN_LOG_FUNC(
-            TURN_LOG_LEVEL_INFO, "session %018llu: realm <%s> user <%s>: incoming packet %s processed, success\n",
-            (unsigned long long)(ss->id), (const char *)(ss->realm_options.name), (const char *)(ss->username), method);
+            TURN_LOG_LEVEL_INFO, "realm <%s> user <%s>: incoming packet %s processed, success (session %018llu)\n",
+            (const char *)(ss->realm_options.name), (const char *)(ss->username), method, (unsigned long long)(ss->id));
       }
     } else {
       if (!reason) {
         reason = get_default_reason(err_code);
       }
       if (ss->origin[0]) {
-        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
-                      "session %018llu: origin <%s> realm <%s> user <%s>: incoming packet %s processed, error %d: %s\n",
-                      (unsigned long long)(ss->id), (const char *)(ss->origin), (const char *)(ss->realm_options.name),
-                      (const char *)(ss->username), method, err_code, reason);
+        TURN_LOG_FUNC(
+            TURN_LOG_LEVEL_INFO,
+            "origin <%s> realm <%s> user <%s>: incoming packet %s processed, error %d: %s (session %018llu)\n",
+            (const char *)(ss->origin), (const char *)(ss->realm_options.name), (const char *)(ss->username), method,
+            err_code, reason, (unsigned long long)(ss->id));
       } else {
         TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
-                      "session %018llu: realm <%s> user <%s>: incoming packet %s processed, error %d: %s\n",
-                      (unsigned long long)(ss->id), (const char *)(ss->realm_options.name),
-                      (const char *)(ss->username), method, err_code, reason);
+                      "realm <%s> user <%s>: incoming packet %s processed, error %d: %s (session %018llu)\n",
+                      (const char *)(ss->realm_options.name), (const char *)(ss->username), method, err_code, reason,
+                      (unsigned long long)(ss->id));
       }
     }
   }
@@ -140,6 +195,11 @@ static inline void log_method(ts_ur_super_session *ss, const char *method, int e
 ///////////////////////////////////////////
 
 static int attach_socket_to_session(turn_turnserver *server, ioa_socket_handle s, ts_ur_super_session *ss);
+
+/* RFC 8016 mobility handoff helpers (defined near handle_turn_refresh). */
+static ts_ur_super_session *mobile_complete_transition(turn_turnserver *server, ts_ur_super_session *pending_ss);
+static void mobile_abort_transition(turn_turnserver *server, ts_ur_super_session *orig_ss);
+static void client_to_be_allocated_timeout_handler(ioa_engine_handle e, void *arg);
 
 static int check_stun_auth(turn_turnserver *server, ts_ur_super_session *ss, stun_tid *tid, int *resp_constructed,
                            int *err_code, const uint8_t **reason, ioa_net_data *in_buffer,
@@ -167,11 +227,14 @@ static int need_stun_authentication(turn_turnserver *server, ts_ur_super_session
 
 /////////////////// timer //////////////////////////
 
+static void turn_server_sweep_timed_events(turn_turnserver *server);
+
 static void timer_timeout_handler(ioa_engine_handle e, void *arg) {
   UNUSED_ARG(e);
   if (arg) {
     turn_turnserver *server = (turn_turnserver *)arg;
     server->ctime = turn_time();
+    turn_server_sweep_timed_events(server);
   }
 }
 
@@ -299,6 +362,20 @@ static int good_peer_addr(turn_turnserver *server, const char *realm, ioa_addr *
     if (ioa_addr_is_zero(peer_addr)) {
       return 0;
     }
+    /* Secure default: never relay to link-local / unique-local / site-local
+     * scopes (incl. the 169.254.169.254 cloud metadata service), regardless of
+     * denied-peer-ip. An IPv4 denied-peer-ip range cannot even express an IPv6
+     * internal target, so this closes the native-IPv6 SSRF path to internal
+     * services such as a ULA-hosted database. */
+    if (ioa_addr_is_internal_deny_default(peer_addr)) {
+      char saddr[MAX_IOA_ADDR_STRING] = "";
+      addr_to_string_no_port(peer_addr, saddr);
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
+                    "A peer IP %s denied: link-local/unique-local/site-local scope is not a "
+                    "permitted relay peer in server %d (session %018llu)\n",
+                    saddr, server_id, (unsigned long long)session_id);
+      return 0;
+    }
 
     if (server->ip_whitelist) {
       // White listing of addr ranges
@@ -333,10 +410,10 @@ static int good_peer_addr(turn_turnserver *server, const char *realm, ioa_addr *
       for (int i = server->ip_blacklist->ranges_number - 1; i >= 0; --i) {
         CHECK_REALM(server->ip_blacklist->rs[i].realm);
         if (ioa_addr_in_range(&(server->ip_blacklist->rs[i].enc), peer_addr)) {
-          char saddr[129];
-          addr_to_string_no_port(peer_addr, (uint8_t *)saddr);
-          TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: A peer IP %s denied in the range: %s in server %d \n",
-                        (unsigned long long)session_id, saddr, server->ip_blacklist->rs[i].str, server_id);
+          char saddr[MAX_IOA_ADDR_STRING] = "";
+          addr_to_string_no_port(peer_addr, saddr);
+          TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "A peer IP %s denied in the range: %s in server %d (session %018llu)\n",
+                        saddr, server->ip_blacklist->rs[i].str, server_id, (unsigned long long)session_id);
           return 0;
         }
       }
@@ -351,11 +428,14 @@ static int good_peer_addr(turn_turnserver *server, const char *realm, ioa_addr *
         for (int i = bl->ranges_number - 1; i >= 0; --i) {
           CHECK_REALM(bl->rs[i].realm);
           if (ioa_addr_in_range(&(bl->rs[i].enc), peer_addr)) {
+            /* The list is replaced and freed by the refresh thread once the lock is released. */
+            char srange[sizeof(bl->rs[i].str)] = "";
+            STRCPY(srange, bl->rs[i].str);
             ioa_unlock_blacklist(server->e);
-            char saddr[129];
-            addr_to_string_no_port(peer_addr, (uint8_t *)saddr);
-            TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: A peer IP %s denied in the range= %s in server %d \n",
-                          (unsigned long long)session_id, saddr, bl->rs[i].str, server_id);
+            char saddr[MAX_IOA_ADDR_STRING] = "";
+            addr_to_string_no_port(peer_addr, saddr);
+            TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "A peer IP %s denied in the range= %s in server %d (session %018llu)\n",
+                          saddr, srange, server_id, (unsigned long long)session_id);
             return 0;
           }
         }
@@ -380,6 +460,48 @@ static inline relay_endpoint_session *get_relay_session_ss(ts_ur_super_session *
 
 static inline ioa_socket_handle get_relay_socket_ss(ts_ur_super_session *ss, int family) {
   return get_relay_socket(&(ss->alloc), family);
+}
+
+static bool is_multiplex_peer_udp_relay(turn_turnserver *server, ioa_socket_handle relay_s) {
+  if (!server || !server->multiplex_peer_mode || !relay_s || get_ioa_socket_type(relay_s) != UDP_SOCKET) {
+    return false;
+  }
+
+  return relay_s == mp_get_socket(server->e, get_ioa_socket_address_family(relay_s));
+}
+
+static int register_multiplex_peer(turn_turnserver *server, ts_ur_super_session *ss, const ioa_addr *peer_addr,
+                                   int *err_code, const uint8_t **reason) {
+  if (!server || !ss || !peer_addr || addr_get_port(peer_addr) == 0) {
+    return 0;
+  }
+
+  ioa_socket_handle relay_s = get_relay_socket_ss(ss, peer_addr->ss.sa_family);
+  if (!is_multiplex_peer_udp_relay(server, relay_s)) {
+    return 0;
+  }
+
+  const int ret = mp_register_peer(server->e, peer_addr, ss);
+  if (ret == MP_REGISTER_LIMIT) {
+    if (err_code) {
+      *err_code = 508;
+    }
+    if (reason) {
+      *reason = (const uint8_t *)"Too many peer endpoints for this allocation";
+    }
+    return -1;
+  }
+  if (ret < 0) {
+    if (err_code) {
+      *err_code = 400;
+    }
+    if (reason) {
+      *reason = (const uint8_t *)"Peer address already used by another multiplex-peer allocation";
+    }
+    return -1;
+  }
+
+  return 0;
 }
 
 /////////// Session info ///////
@@ -407,7 +529,7 @@ void turn_session_info_add_peer(struct turn_session_info *tsi, ioa_addr *peer) {
   if (tsi->main_peers_size < TURN_MAIN_PEERS_ARRAY_SIZE) {
     addr_cpy(&(tsi->main_peers_data[tsi->main_peers_size].addr), peer);
     addr_to_string(&(tsi->main_peers_data[tsi->main_peers_size].addr),
-                   (uint8_t *)tsi->main_peers_data[tsi->main_peers_size].saddr);
+                   tsi->main_peers_data[tsi->main_peers_size].saddr);
     tsi->main_peers_size += 1;
     return;
   }
@@ -420,15 +542,11 @@ void turn_session_info_add_peer(struct turn_session_info *tsi, ioa_addr *peer) {
     }
   }
 
-  addr_data *pTmp = (addr_data *)realloc(tsi->extra_peers_data, (tsi->extra_peers_size + 1) * sizeof(addr_data));
-  if (!pTmp) {
-    return;
-  }
-
+  addr_data *pTmp = (addr_data *)turn_realloc(tsi->extra_peers_data, (tsi->extra_peers_size + 1) * sizeof(addr_data));
   tsi->extra_peers_data = pTmp;
   addr_cpy(&(tsi->extra_peers_data[tsi->extra_peers_size].addr), peer);
   addr_to_string(&(tsi->extra_peers_data[tsi->extra_peers_size].addr),
-                 (uint8_t *)tsi->extra_peers_data[tsi->extra_peers_size].saddr);
+                 tsi->extra_peers_data[tsi->extra_peers_size].saddr);
   tsi->extra_peers_size += 1;
 }
 
@@ -473,9 +591,9 @@ int turn_session_info_copy_from(struct turn_session_info *tsi, ts_ur_super_sessi
       if (ss->client_socket) {
         tsi->client_protocol = get_ioa_socket_type(ss->client_socket);
         addr_cpy(&(tsi->local_addr_data.addr), get_local_addr_from_ioa_socket(ss->client_socket));
-        addr_to_string(&(tsi->local_addr_data.addr), (uint8_t *)tsi->local_addr_data.saddr);
+        addr_to_string(&(tsi->local_addr_data.addr), tsi->local_addr_data.saddr);
         addr_cpy(&(tsi->remote_addr_data.addr), get_remote_addr_from_ioa_socket(ss->client_socket));
-        addr_to_string(&(tsi->remote_addr_data.addr), (uint8_t *)tsi->remote_addr_data.saddr);
+        addr_to_string(&(tsi->remote_addr_data.addr), tsi->remote_addr_data.saddr);
       }
       {
         if (ss->alloc.relay_sessions[ALLOC_IPV4_INDEX].s) {
@@ -483,7 +601,7 @@ int turn_session_info_copy_from(struct turn_session_info *tsi, ts_ur_super_sessi
           if (ss->alloc.is_valid) {
             addr_cpy(&(tsi->relay_addr_data_ipv4.addr),
                      get_local_addr_from_ioa_socket(ss->alloc.relay_sessions[ALLOC_IPV4_INDEX].s));
-            addr_to_string(&(tsi->relay_addr_data_ipv4.addr), (uint8_t *)tsi->relay_addr_data_ipv4.saddr);
+            addr_to_string(&(tsi->relay_addr_data_ipv4.addr), tsi->relay_addr_data_ipv4.saddr);
           }
         }
         if (ss->alloc.relay_sessions[ALLOC_IPV6_INDEX].s) {
@@ -491,7 +609,7 @@ int turn_session_info_copy_from(struct turn_session_info *tsi, ts_ur_super_sessi
           if (ss->alloc.is_valid) {
             addr_cpy(&(tsi->relay_addr_data_ipv6.addr),
                      get_local_addr_from_ioa_socket(ss->alloc.relay_sessions[ALLOC_IPV6_INDEX].s));
-            addr_to_string(&(tsi->relay_addr_data_ipv6.addr), (uint8_t *)tsi->relay_addr_data_ipv6.saddr);
+            addr_to_string(&(tsi->relay_addr_data_ipv6.addr), tsi->relay_addr_data_ipv6.saddr);
           }
         }
       }
@@ -782,7 +900,8 @@ void turn_cancel_session(turn_turnserver *server, turnsession_id sid) {
   if (server) {
     ts_ur_super_session *ts = get_session_from_map(server, sid);
     if (ts) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Session %018llu to be forcefully canceled\n", (unsigned long long)sid);
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Session to be forcefully canceled (session %018llu)\n",
+                    (unsigned long long)sid);
       shutdown_client_connection(server, ts, 0, "Forceful shutdown");
     }
   }
@@ -803,10 +922,7 @@ static ts_ur_super_session *create_new_ss(turn_turnserver *server) {
   //
   // printf("%s: 111.111: session size=%lu\n",__FUNCTION__,(unsigned long)sizeof(ts_ur_super_session));
   //
-  ts_ur_super_session *ss = (ts_ur_super_session *)calloc(1, sizeof(ts_ur_super_session));
-  if (!ss) {
-    return NULL;
-  }
+  ts_ur_super_session *ss = (ts_ur_super_session *)turn_calloc(1, sizeof(ts_ur_super_session));
   ss->server = server;
   get_default_realm_options(&(ss->realm_options));
   put_session_into_map(ss);
@@ -877,12 +993,15 @@ static void client_ss_perm_timeout_handler(ioa_engine_handle e, void *arg) {
     return;
   }
 
-  if (!(tinfo->lifetime_ev)) {
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "!!! %s: strange (1) permission to be cleaned\n", __FUNCTION__);
-  }
-
   if (!(tinfo->owner)) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "!!! %s: strange (2) permission to be cleaned\n", __FUNCTION__);
+  }
+
+  allocation *a = (allocation *)tinfo->owner;
+  ts_ur_super_session *ss = a ? (ts_ur_super_session *)a->owner : NULL;
+  turn_turnserver *server = ss ? (turn_turnserver *)ss->server : NULL;
+  if (server && server->multiplex_peer_mode) {
+    mp_deregister_permission_peers(server->e, &tinfo->addr, ss);
   }
 
   turn_permission_clean(tinfo);
@@ -904,17 +1023,16 @@ static int update_turn_permission_lifetime(ts_ur_super_session *ss, turn_permiss
       }
       tinfo->expiration_time = server->ctime + time_delta;
 
-      IOA_EVENT_DEL(tinfo->lifetime_ev);
-      tinfo->lifetime_ev = set_ioa_timer(server->e, time_delta, 0, client_ss_perm_timeout_handler, tinfo, 0,
-                                         "client_ss_channel_timeout_handler");
+      /* Expiry is reaped lazily by the per-thread sweep in timer_timeout_handler();
+       * touching the permission only needs to push its expiration_time forward. */
 
       if (server->verbose) {
-        tinfo->verbose = 1;
+        tinfo->verbose = true;
         tinfo->session_id = ss->id;
-        char s[257] = "\0";
-        addr_to_string(&(tinfo->addr), (uint8_t *)s);
-        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: peer %s lifetime updated: %lu\n",
-                      (unsigned long long)ss->id, s, (unsigned long)time_delta);
+        char s[MAX_IOA_ADDR_STRING] = "";
+        addr_to_string(&(tinfo->addr), s);
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "peer %s lifetime updated: %lu (session %018llu)\n", s,
+                      (unsigned long)time_delta, (unsigned long long)ss->id);
       }
 
       return 0;
@@ -941,15 +1059,94 @@ static int update_channel_lifetime(ts_ur_super_session *ss, ch_info *chn) {
 
         chn->expiration_time = server->ctime + *(server->channel_lifetime);
 
-        IOA_EVENT_DEL(chn->lifetime_ev);
-        chn->lifetime_ev = set_ioa_timer(server->e, *(server->channel_lifetime), 0, client_ss_channel_timeout_handler,
-                                         chn, 0, "client_ss_channel_timeout_handler");
+        /* Channel expiry is reaped lazily by the per-thread sweep in
+         * timer_timeout_handler(); just push its expiration_time forward. */
 
         return 0;
       }
     }
   }
   return -1;
+}
+
+//////////////// lazy expiry sweep ////////////////////////
+
+/* Reap expired permissions and channels for a single allocation. This replaces
+ * the former per-permission / per-channel libevent timers: update_*_lifetime()
+ * only pushes expiration_time forward, and this sweep (driven once per second by
+ * the per-thread timer_timeout_handler) tears down whatever has fallen past its
+ * deadline. At high allocation counts this trades ~1M libevent min-heap nodes and
+ * two heap ops per refresh for a bounded per-thread array walk. */
+static void sweep_allocation_timed_events(turn_turnserver *server, allocation *a) {
+  if (!a || !is_allocation_valid(a)) {
+    return;
+  }
+
+  const turn_time_t ctime = server->ctime;
+
+  /* Permissions first: cleaning a permission also tears down its channels, so
+   * channels of an expired permission are already gone by the channel pass. */
+  turn_permission_hashtable *pmap = allocation_get_turn_permission_hashtable(a);
+  for (size_t i = 0; i < TURN_PERMISSION_HASHTABLE_SIZE; ++i) {
+    turn_permission_array *parray = &(pmap->table[i]);
+    for (size_t j = 0; j < TURN_PERMISSION_ARRAY_SIZE; ++j) {
+      turn_permission_info *tinfo = &(parray->main_slots[j].info);
+      if (tinfo->allocated && turn_time_before(tinfo->expiration_time, ctime)) {
+        client_ss_perm_timeout_handler(server->e, tinfo);
+      }
+    }
+    if (parray->extra_slots) {
+      for (size_t j = 0; j < parray->extra_sz; ++j) {
+        turn_permission_slot *slot = parray->extra_slots[j];
+        if (slot && slot->info.allocated && turn_time_before(slot->info.expiration_time, ctime)) {
+          client_ss_perm_timeout_handler(server->e, &(slot->info));
+        }
+      }
+    }
+  }
+
+  /* Channels whose owning permission is still alive but whose own deadline passed. */
+  ch_map *cmap = &(a->chns);
+  for (size_t i = 0; i < CH_MAP_HASH_SIZE; ++i) {
+    ch_map_array *carray = &(cmap->table[i]);
+    for (size_t j = 0; j < CH_MAP_ARRAY_SIZE; ++j) {
+      ch_info *chn = &(carray->main_chns[j]);
+      if (chn->allocated && turn_time_before(chn->expiration_time, ctime)) {
+        client_ss_channel_timeout_handler(server->e, chn);
+      }
+    }
+    if (carray->extra_chns) {
+      for (size_t j = 0; j < carray->extra_sz; ++j) {
+        ch_info *chn = carray->extra_chns[j];
+        if (chn && chn->allocated && turn_time_before(chn->expiration_time, ctime)) {
+          client_ss_channel_timeout_handler(server->e, chn);
+        }
+      }
+    }
+  }
+}
+
+static bool sweep_session_cb(ur_map_key_type key, ur_map_value_type value, void *arg) {
+  UNUSED_ARG(key);
+  if (value) {
+    ts_ur_super_session *ss = (ts_ur_super_session *)value;
+    turn_turnserver *server = (turn_turnserver *)arg;
+    /* RFC 8016: if a mobility handoff has been open past its deadline without the
+     * client sending on the new path, abandon it — keep the allocation on the
+     * old path and reap the pending session. Only marks sessions to_be_closed /
+     * clears links, so it is safe during map iteration. */
+    if (ss->mobile_pending_resume && !turn_time_before(server->ctime, ss->mobile_transition_deadline)) {
+      mobile_abort_transition(server, ss);
+    }
+    sweep_allocation_timed_events(server, get_allocation_ss(ss));
+  }
+  return false; /* keep iterating all sessions */
+}
+
+static void turn_server_sweep_timed_events(turn_turnserver *server) {
+  if (server && server->sessions_map) {
+    ur_map_foreach_arg(server->sessions_map, sweep_session_cb, server);
+  }
 }
 
 /////////////// TURN ///////////////////////////
@@ -964,8 +1161,8 @@ static int update_channel_lifetime(ts_ur_super_session *ss, ch_info *chn) {
   case STUN_ATTRIBUTE_REALM:                                                                                           \
   case STUN_ATTRIBUTE_NONCE:                                                                                           \
   case STUN_ATTRIBUTE_ORIGIN:                                                                                          \
-    sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh), \
-                                 sar);                                                                                 \
+    sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),                                      \
+                                         ioa_network_buffer_get_size(in_buffer->nbh), sar);                            \
     continue
 
 static uint8_t get_transport_value(const uint8_t *value) {
@@ -1000,12 +1197,7 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
         addr_set_any(&xor_relayed_addr1);
         pxor_relayed_addr1 = &xor_relayed_addr1;
       } else if (relayed_addr1) {
-        if (server->external_ip_set) {
-          addr_cpy(&xor_relayed_addr1, &(server->external_ip));
-          addr_set_port(&xor_relayed_addr1, addr_get_port(relayed_addr1));
-        } else {
-          addr_cpy(&xor_relayed_addr1, relayed_addr1);
-        }
+        turn_set_xor_relayed_addr(server, &xor_relayed_addr1, relayed_addr1);
         pxor_relayed_addr1 = &xor_relayed_addr1;
       }
 
@@ -1013,12 +1205,7 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
         addr_set_any(&xor_relayed_addr2);
         pxor_relayed_addr2 = &xor_relayed_addr2;
       } else if (relayed_addr2) {
-        if (server->external_ip_set) {
-          addr_cpy(&xor_relayed_addr2, &(server->external_ip));
-          addr_set_port(&xor_relayed_addr2, addr_get_port(relayed_addr2));
-        } else {
-          addr_cpy(&xor_relayed_addr2, relayed_addr2);
-        }
+        turn_set_xor_relayed_addr(server, &xor_relayed_addr2, relayed_addr2);
         pxor_relayed_addr2 = &xor_relayed_addr2;
       }
 
@@ -1031,7 +1218,8 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
         }
         stun_set_allocate_response_str(ioa_network_buffer_data(nbh), &len, tid, pxor_relayed_addr1, pxor_relayed_addr2,
                                        get_remote_addr_from_ioa_socket(ss->client_socket), lifetime,
-                                       *(server->max_allocate_lifetime), 0, NULL, 0, ss->s_mobile_id);
+                                       *(server->max_allocate_lifetime), 0, NULL, 0, ss->s_mobile_id,
+                                       server->include_reason_string);
         ioa_network_buffer_set_size(nbh, len);
         *resp_constructed = 1;
       }
@@ -1144,7 +1332,7 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
             *err_code = 400;
             *reason = (const uint8_t *)"Wrong Lifetime Data";
           } else {
-            lifetime = nswap32(*((const uint32_t *)value));
+            lifetime = turn_read_u32(value);
           }
         }
       } break;
@@ -1223,8 +1411,8 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
           unknown_attrs[(*ua_num)++] = nswap16(attr_type);
         }
       };
-      sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh),
-                                   sar);
+      sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),
+                                           ioa_network_buffer_get_size(in_buffer->nbh), sar);
     }
 
     if (!transport) {
@@ -1258,7 +1446,8 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
         }
       }
 
-      lifetime = stun_adjust_allocate_lifetime(lifetime, *(server->max_allocate_lifetime), ss->max_session_time_auth);
+      lifetime =
+          stun_adjust_allocate_lifetime(lifetime, *(server->max_allocate_lifetime), oauth_remaining_lifetime(ss));
       uint64_t out_reservation_token = 0;
 
       if (inc_quota(ss, username) < 0) {
@@ -1290,12 +1479,19 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
 
         if (af4 && af6) {
           if (server->external_ip_set) {
-            *err_code = 440;
+            /* RFC 8656 par. 7.2: both families are supported here, the server
+             * just cannot do a dual allocation with a rewritten external
+             * address -- 508 (Insufficient Capacity), not 440, so clients do
+             * not conclude the server lacks an address family entirely. */
+            *err_code = 508;
             *reason = (const uint8_t *)"Dual allocation cannot be supported in the current server configuration";
           }
           if (even_port > 0) {
-            *err_code = 440;
-            *reason = (const uint8_t *)"Dual allocation cannot be supported with even-port functionality";
+            /* Unreachable backstop: the attribute loop above already rejects
+             * ADDITIONAL-ADDRESS-FAMILY + EVEN-PORT in both orderings. Kept
+             * with the same 400 the loop uses (malformed combination). */
+            *err_code = 400;
+            *reason = (const uint8_t *)"Even Port cannot be used with Dual Allocation";
           }
         }
 
@@ -1414,12 +1610,7 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
             addr_set_any(&xor_relayed_addr1);
             pxor_relayed_addr1 = &xor_relayed_addr1;
           } else if (relayed_addr1) {
-            if (server->external_ip_set) {
-              addr_cpy(&xor_relayed_addr1, &(server->external_ip));
-              addr_set_port(&xor_relayed_addr1, addr_get_port(relayed_addr1));
-            } else {
-              addr_cpy(&xor_relayed_addr1, relayed_addr1);
-            }
+            turn_set_xor_relayed_addr(server, &xor_relayed_addr1, relayed_addr1);
             pxor_relayed_addr1 = &xor_relayed_addr1;
           }
 
@@ -1427,12 +1618,7 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
             addr_set_any(&xor_relayed_addr2);
             pxor_relayed_addr2 = &xor_relayed_addr2;
           } else if (relayed_addr2) {
-            if (server->external_ip_set) {
-              addr_cpy(&xor_relayed_addr2, &(server->external_ip));
-              addr_set_port(&xor_relayed_addr2, addr_get_port(relayed_addr2));
-            } else {
-              addr_cpy(&xor_relayed_addr2, relayed_addr2);
-            }
+            turn_set_xor_relayed_addr(server, &xor_relayed_addr2, relayed_addr2);
             pxor_relayed_addr2 = &xor_relayed_addr2;
           }
 
@@ -1441,7 +1627,7 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
             stun_set_allocate_response_str(ioa_network_buffer_data(nbh), &len, tid, pxor_relayed_addr1,
                                            pxor_relayed_addr2, get_remote_addr_from_ioa_socket(ss->client_socket),
                                            lifetime, *(server->max_allocate_lifetime), 0, NULL, out_reservation_token,
-                                           ss->s_mobile_id);
+                                           ss->s_mobile_id, server->include_reason_string);
 
             if (ss->bps) {
               stun_attr_add_bandwidth_str(ioa_network_buffer_data(nbh), &len, ss->bps);
@@ -1465,7 +1651,8 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
 
     size_t len = ioa_network_buffer_get_size(nbh);
     stun_set_allocate_response_str(ioa_network_buffer_data(nbh), &len, tid, NULL, NULL, NULL, 0,
-                                   *(server->max_allocate_lifetime), *err_code, *reason, 0, ss->s_mobile_id);
+                                   *(server->max_allocate_lifetime), *err_code, *reason, 0, ss->s_mobile_id,
+                                   server->include_reason_string);
     ioa_network_buffer_set_size(nbh, len);
     *resp_constructed = 1;
   }
@@ -1488,7 +1675,13 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
   return 0;
 }
 
-static void copy_auth_parameters(ts_ur_super_session *orig_ss, ts_ur_super_session *ss) {
+/* Copy orig_ss's auth context onto ss. acquire_quota controls whether ss takes
+ * an allocation quota unit under the copied identity: pass true when ss is the
+ * session that will own the allocation, false when orig_ss already holds the
+ * allocation's single quota unit (a mobility resume, where ss is only the
+ * temporary resuming session and must not be charged a second time). In both
+ * cases any stale charge ss held under its previous identity is released first. */
+static void copy_auth_parameters(ts_ur_super_session *orig_ss, ts_ur_super_session *ss, bool acquire_quota) {
   if (orig_ss && ss) {
     dec_quota(ss);
     memcpy(ss->nonce, orig_ss->nonce, sizeof(ss->nonce));
@@ -1501,8 +1694,142 @@ static void copy_auth_parameters(ts_ur_super_session *orig_ss, ts_ur_super_sessi
     memcpy(ss->origin, orig_ss->origin, sizeof(ss->origin));
     ss->origin_set = orig_ss->origin_set;
     memcpy(ss->pwd, orig_ss->pwd, sizeof(ss->pwd));
-    ss->max_session_time_auth = orig_ss->max_session_time_auth;
-    inc_quota(ss, ss->username);
+    ss->oauth_expiration_time = orig_ss->oauth_expiration_time;
+    if (acquire_quota) {
+      inc_quota(ss, ss->username);
+    }
+  }
+}
+
+/* RFC 8016 graceful dual-5-tuple mobility handoff.
+ *
+ * A mobility resume does not hard-switch the allocation onto the new client
+ * path at REFRESH time. Instead the allocation stays on the original session
+ * (peer->client keeps flowing to the old 5-tuple) and the resuming session is
+ * kept alive and linked as "pending". The allocation is promoted onto the new
+ * socket on the first client->peer datagram (Send indication / ChannelData) on
+ * the new path, or aborted back to the old path if a bounded deadline elapses
+ * with no such datagram. See docs/mobility-rfc8016.md. */
+
+/* Seconds to keep the dual-5-tuple transition open waiting for the client to
+ * send on the new path before conservatively abandoning it (keeping the old
+ * path). The RFC-conformant trigger is the client's first Send/ChannelData on
+ * the new 5-tuple, which in practice arrives well within this window. */
+#define MOBILITY_TRANSITION_TIMEOUT (30)
+
+/* Link a resuming session (new client path) to its allocation session and open
+ * the transition window. orig_ss keeps the allocation and the old client
+ * socket; pending_ss keeps the new client socket and is kept alive for the
+ * window (its un-allocated watchdog is disarmed and its stray mobile-map entry
+ * removed, since it owns no allocation of its own). */
+static void mobile_begin_transition(turn_turnserver *server, ts_ur_super_session *orig_ss,
+                                    ts_ur_super_session *pending_ss) {
+  /* At most one pending resume per allocation. If a transition is already open,
+   * fully tear down the previous pending session before opening the new one.
+   * Otherwise chained resumes from fresh 5-tuples would overwrite the single
+   * backlink below and orphan every superseded pending session: each has had its
+   * un-allocated watchdog disarmed and, once orig_ss->mobile_pending_resume no
+   * longer names it, is unreachable by the transition-deadline sweep, so it
+   * stays allocated indefinitely. This runs in REFRESH packet context (not the
+   * session-map sweep), so a synchronous shutdown is safe; it also clears
+   * orig_ss->mobile_pending_resume via shutdown's transition-unlink path. */
+  if (orig_ss->mobile_pending_resume) {
+    ts_ur_super_session *stale_ss = get_session_from_map(server, orig_ss->mobile_pending_resume);
+    if (stale_ss) {
+      shutdown_client_connection(server, stale_ss, 1, "superseded by newer mobility resume");
+    }
+    orig_ss->mobile_pending_resume = 0;
+    orig_ss->mobile_transition_deadline = 0;
+  }
+
+  /* A pending session must never itself be resumable. */
+  delete_session_from_mobile_map(pending_ss);
+  /* Do not let the un-allocated watchdog reap the pending session; it owns no
+   * allocation until (and unless) it is promoted. */
+  IOA_EVENT_DEL(pending_ss->to_be_allocated_timeout_ev);
+
+  orig_ss->mobile_pending_resume = pending_ss->id;
+  orig_ss->mobile_transition_deadline = server->ctime + MOBILITY_TRANSITION_TIMEOUT;
+  pending_ss->mobile_resume_target = orig_ss->id;
+
+  if (server->verbose) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
+                  "mobility handoff started: dual-5-tuple transition to session %018llu (session %018llu)\n",
+                  (unsigned long long)pending_ss->id, (unsigned long long)orig_ss->id);
+  }
+}
+
+/* Promote the allocation onto the pending session's new client socket: move the
+ * socket into the original allocation session, close the old client socket
+ * (discarding the old 5-tuple), tear down the now-spent pending session, and
+ * return the allocation session (now living on the new path). Returns NULL on
+ * failure or if the allocation session no longer exists. */
+static ts_ur_super_session *mobile_complete_transition(turn_turnserver *server, ts_ur_super_session *pending_ss) {
+  ts_ur_super_session *orig_ss = get_session_from_map(server, pending_ss->mobile_resume_target);
+
+  /* Clear the link regardless of outcome so we never promote twice. */
+  const turnsession_id pending_id = pending_ss->id;
+  pending_ss->mobile_resume_target = 0;
+  if (!orig_ss) {
+    return NULL;
+  }
+  /* Promote only if this session is still the allocation's current pending
+   * resume. A superseded pending session (its transition was replaced by a
+   * newer resume) must not clear the allocation's live transition state or
+   * steal a socket move that belongs to the current pending session. */
+  if (orig_ss->mobile_pending_resume != pending_id) {
+    return NULL;
+  }
+  orig_ss->mobile_pending_resume = 0;
+  orig_ss->mobile_transition_deadline = 0;
+
+  ioa_socket_handle s = detach_ioa_socket(pending_ss->client_socket);
+  pending_ss->to_be_closed = true;
+  if (!s) {
+    return NULL;
+  }
+
+  if (attach_socket_to_session(server, s, orig_ss) < 0) {
+    if (orig_ss->client_socket != s) {
+      IOA_CLOSE_SOCKET(s);
+    }
+    return NULL;
+  }
+
+  /* Carry the resuming session's (refreshed) auth context onto the allocation
+   * session; both hold the same owner credentials after the resume. The
+   * allocation's single quota unit stays on the surviving session (acquire_quota
+   * re-checks it under the refreshed identity); the pending session was never
+   * separately charged, so its teardown below releases nothing. */
+  if (pending_ss->hmackey_set) {
+    copy_auth_parameters(pending_ss, orig_ss, true);
+  }
+
+  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
+                "mobility handoff completed: allocation moved to new client path (session %018llu)\n",
+                (unsigned long long)orig_ss->id);
+
+  return orig_ss;
+}
+
+/* Abandon a transition that timed out (or whose pending session died): keep the
+ * allocation on the original/old path and reap the pending session. */
+static void mobile_abort_transition(turn_turnserver *server, ts_ur_super_session *orig_ss) {
+  ts_ur_super_session *pending_ss = get_session_from_map(server, orig_ss->mobile_pending_resume);
+  orig_ss->mobile_pending_resume = 0;
+  orig_ss->mobile_transition_deadline = 0;
+  if (pending_ss && pending_ss->mobile_resume_target == orig_ss->id) {
+    pending_ss->mobile_resume_target = 0;
+    pending_ss->to_be_closed = true;
+    /* An abandoned pending client may sit idle forever (it never sends on the new
+     * path), and to_be_closed is only observed when a packet next arrives on the
+     * session's socket. The pending's un-allocated watchdog was disarmed when the
+     * transition opened, so re-arm it to reap the session from timer context. This
+     * only schedules a timer, so it is safe during the map-iterating sweep (the
+     * shutdown happens later, from the timer handler, not here). */
+    IOA_EVENT_DEL(pending_ss->to_be_allocated_timeout_ev);
+    pending_ss->to_be_allocated_timeout_ev =
+        set_ioa_timer(server->e, 1, 0, client_to_be_allocated_timeout_handler, pending_ss, 0, "mobile_pending_reap");
   }
 }
 
@@ -1581,7 +1908,7 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
             *err_code = 400;
             *reason = (const uint8_t *)"Wrong lifetime field data";
           } else {
-            lifetime = nswap32(*((const uint32_t *)value));
+            lifetime = turn_read_u32(value);
             if (!lifetime) {
               to_delete = 1;
             }
@@ -1624,8 +1951,8 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
           unknown_attrs[(*ua_num)++] = nswap16(attr_type);
         }
       };
-      sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh),
-                                   sar);
+      sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),
+                                           ioa_network_buffer_get_size(in_buffer->nbh), sar);
     }
 
     if (*ua_num > 0) {
@@ -1664,14 +1991,15 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
             *reason = (const uint8_t *)"Server send socket procedure is not set";
           }
 
-          ss->to_be_closed = 1;
+          ss->to_be_closed = true;
 
         } else {
 
           ts_ur_super_session *orig_ss = get_session_from_mobile_map(server, mid);
           if (!orig_ss || orig_ss->to_be_closed || ioa_socket_tobeclosed(orig_ss->client_socket)) {
-            *err_code = 404;
-            *reason = (const uint8_t *)"Allocation not found";
+            /* RFC 8016: an unusable/unknown ticket is an Allocation Mismatch. */
+            *err_code = 437;
+            *reason = (const uint8_t *)"Allocation Mismatch";
           } else if (orig_ss == ss) {
             *err_code = 437;
             *reason = (const uint8_t *)"Invalid allocation";
@@ -1691,8 +2019,19 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
             // Check security:
             int postpone_reply = 0;
 
-            if (!(ss->hmackey_set)) {
-              copy_auth_parameters(orig_ss, ss);
+            // A mobility resume must be authorized by the ORIGINAL allocation's
+            // owner. Unconditionally adopt the original session's credentials so
+            // that check_stun_auth() below verifies this REFRESH's
+            // MESSAGE-INTEGRITY (and USERNAME/REALM) against the original owner's
+            // key. Gating this on the resuming session being unauthenticated let
+            // an already-authenticated session be validated against its own
+            // credentials rather than the resumed allocation's owner.
+            // acquire_quota=false: orig_ss keeps holding the allocation's single
+            // quota unit for the whole mobility grace period, so charging this
+            // temporary resuming session too would double-count and reject
+            // legitimate resumes under --user-quota / --total-quota.
+            if (!oauth_lookup_matches_request(ss, tid, in_buffer->nbh)) {
+              copy_auth_parameters(orig_ss, ss, false);
             }
 
             if (check_stun_auth(server, ss, tid, resp_constructed, err_code, reason, in_buffer, nbh,
@@ -1714,7 +2053,7 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
                 lifetime = 0;
               } else {
                 lifetime = stun_adjust_allocate_lifetime(lifetime, *(server->max_allocate_lifetime),
-                                                         ss->max_session_time_auth);
+                                                         oauth_remaining_lifetime(ss));
               }
 
               if (af4c && refresh_relay_connection(server, orig_ss, lifetime, 0, 0, 0, err_code, AF_INET) < 0) {
@@ -1733,78 +2072,63 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
 
               } else {
 
-                // Transfer socket:
+                // RFC 8016 graceful handoff: keep the allocation on orig_ss so
+                // peer->client traffic keeps flowing to the old 5-tuple, and open
+                // a dual-5-tuple transition rather than hard-switching now. The
+                // allocation is promoted onto this new socket on the client's
+                // first Send/ChannelData on the new path (see read_client_connection),
+                // or abandoned back to the old path after a bounded deadline (see
+                // the per-session sweep).
 
-                ioa_socket_handle s = detach_ioa_socket(ss->client_socket);
+                // Rotate the mobility ticket (the new ticket MUST differ from the
+                // old) and re-key orig_ss in the mobile map under the new id.
+                delete_session_from_mobile_map(orig_ss);
+                put_session_into_mobile_map(orig_ss);
+                orig_ss->old_mobile_id = mid;
 
-                ss->to_be_closed = 1;
+                mobile_begin_transition(server, orig_ss, ss);
 
-                if (!s) {
-                  *err_code = 500;
-                } else {
+                turn_report_allocation_set(&(orig_ss->alloc), lifetime, 1);
 
-                  if (attach_socket_to_session(server, s, orig_ss) < 0) {
-                    if (orig_ss->client_socket != s) {
-                      IOA_CLOSE_SOCKET(s);
-                    }
-                    *err_code = 500;
-                  } else {
+                // Build the REFRESH success response carrying the new ticket. It
+                // is sent on the resuming session's new socket (ss is left as the
+                // pending session), so the roaming client learns the allocation
+                // survived the move.
+                nbh = ioa_network_buffer_allocate(server->e);
+                size_t len = ioa_network_buffer_get_size(nbh);
 
-                    if (ss->hmackey_set) {
-                      copy_auth_parameters(ss, orig_ss);
-                    }
+                stun_init_success_response_str(STUN_METHOD_REFRESH, ioa_network_buffer_data(nbh), &len, tid);
+                uint32_t lt = nswap32(lifetime);
 
-                    delete_session_from_mobile_map(ss);
-                    delete_session_from_mobile_map(orig_ss);
-                    put_session_into_mobile_map(orig_ss);
+                stun_attr_add_str(ioa_network_buffer_data(nbh), &len, STUN_ATTRIBUTE_LIFETIME, (const uint8_t *)&lt, 4);
+                ioa_network_buffer_set_size(nbh, len);
 
-                    // Use new buffer and redefine ss:
-                    nbh = ioa_network_buffer_allocate(server->e);
+                stun_attr_add_str(ioa_network_buffer_data(nbh), &len, STUN_ATTRIBUTE_MOBILITY_TICKET,
+                                  (uint8_t *)orig_ss->s_mobile_id, strlen(orig_ss->s_mobile_id));
+                ioa_network_buffer_set_size(nbh, len);
 
-                    dec_quota(ss);
-                    ss = orig_ss;
-                    inc_quota(ss, ss->username);
+                maybe_add_software_attribute(server, nbh);
 
-                    ss->old_mobile_id = mid;
-                    size_t len = ioa_network_buffer_get_size(nbh);
-
-                    turn_report_allocation_set(&(ss->alloc), lifetime, 1);
-
-                    stun_init_success_response_str(STUN_METHOD_REFRESH, ioa_network_buffer_data(nbh), &len, tid);
-                    uint32_t lt = nswap32(lifetime);
-
-                    stun_attr_add_str(ioa_network_buffer_data(nbh), &len, STUN_ATTRIBUTE_LIFETIME, (const uint8_t *)&lt,
-                                      4);
-                    ioa_network_buffer_set_size(nbh, len);
-
-                    stun_attr_add_str(ioa_network_buffer_data(nbh), &len, STUN_ATTRIBUTE_MOBILITY_TICKET,
-                                      (uint8_t *)ss->s_mobile_id, strlen(ss->s_mobile_id));
-                    ioa_network_buffer_set_size(nbh, len);
-
-                    maybe_add_software_attribute(server, nbh);
-
-                    if (message_integrity) {
-                      size_t len = ioa_network_buffer_get_size(nbh);
-                      stun_attr_add_integrity_str(server->ct, ioa_network_buffer_data(nbh), &len, ss->hmackey, ss->pwd,
-                                                  SHATYPE_DEFAULT);
-                      ioa_network_buffer_set_size(nbh, len);
-                    }
-
-                    if ((server->fingerprint) || ss->enforce_fingerprints) {
-                      size_t len = ioa_network_buffer_get_size(nbh);
-                      if (!stun_attr_add_fingerprint_str(ioa_network_buffer_data(nbh), &len)) {
-                        *err_code = 500;
-                        ioa_network_buffer_delete(server->e, nbh);
-                        return -1;
-                      }
-                      ioa_network_buffer_set_size(nbh, len);
-                    }
-
-                    *no_response = 1;
-
-                    return write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE);
-                  }
+                if (message_integrity) {
+                  size_t ilen = ioa_network_buffer_get_size(nbh);
+                  turn_attr_add_integrity_key_len_str(server->ct, ioa_network_buffer_data(nbh), &ilen, ss->hmackey,
+                                                      turn_session_hmackey_size(server, ss), ss->pwd, SHATYPE_DEFAULT);
+                  ioa_network_buffer_set_size(nbh, ilen);
                 }
+
+                if ((server->fingerprint) || ss->enforce_fingerprints) {
+                  size_t flen = ioa_network_buffer_get_size(nbh);
+                  if (!stun_attr_add_fingerprint_str(ioa_network_buffer_data(nbh), &flen)) {
+                    *err_code = 500;
+                    ioa_network_buffer_delete(server->e, nbh);
+                    return -1;
+                  }
+                  ioa_network_buffer_set_size(nbh, flen);
+                }
+
+                *no_response = 1;
+
+                return write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE);
               }
             }
 
@@ -1821,7 +2145,8 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
       if (to_delete) {
         lifetime = 0;
       } else {
-        lifetime = stun_adjust_allocate_lifetime(lifetime, *(server->max_allocate_lifetime), ss->max_session_time_auth);
+        lifetime =
+            stun_adjust_allocate_lifetime(lifetime, *(server->max_allocate_lifetime), oauth_remaining_lifetime(ss));
       }
 
       if (!af4 && !af6) {
@@ -1874,7 +2199,8 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
       }
 
       size_t len = ioa_network_buffer_get_size(nbh);
-      stun_init_error_response_str(STUN_METHOD_REFRESH, ioa_network_buffer_data(nbh), &len, *err_code, *reason, tid);
+      stun_init_error_response_str(STUN_METHOD_REFRESH, ioa_network_buffer_data(nbh), &len, *err_code, *reason, tid,
+                                   server->include_reason_string);
       ioa_network_buffer_set_size(nbh, len);
 
       *resp_constructed = 1;
@@ -2049,23 +2375,24 @@ static void tcp_peer_connection_completed_callback(int success, void *arg) {
         err_code = 447;
       }
       {
-        char ls[257] = "\0";
-        char rs[257] = "\0";
+        char ls[MAX_IOA_ADDR_STRING] = "";
+        char rs[MAX_IOA_ADDR_STRING] = "";
         ioa_addr *laddr = get_local_addr_from_ioa_socket(ss->client_socket);
         if (laddr) {
-          addr_to_string(laddr, (uint8_t *)ls);
+          addr_to_string(laddr, ls);
         }
-        addr_to_string(&(tc->peer_addr), (uint8_t *)rs);
+        addr_to_string(&(tc->peer_addr), rs);
         TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s: failure to connect from %s to %s\n", __FUNCTION__, ls, rs);
       }
-      stun_init_error_response_str(STUN_METHOD_CONNECT, ioa_network_buffer_data(nbh), &len, err_code, NULL, &(tc->tid));
+      stun_init_error_response_str(STUN_METHOD_CONNECT, ioa_network_buffer_data(nbh), &len, err_code, NULL, &(tc->tid),
+                                   server->include_reason_string);
     }
 
     ioa_network_buffer_set_size(nbh, len);
 
     if (need_stun_authentication(server, ss)) {
-      stun_attr_add_integrity_str(server->ct, ioa_network_buffer_data(nbh), &len, ss->hmackey, ss->pwd,
-                                  SHATYPE_DEFAULT);
+      turn_attr_add_integrity_key_len_str(server->ct, ioa_network_buffer_data(nbh), &len, ss->hmackey,
+                                          turn_session_hmackey_size(server, ss), ss->pwd, SHATYPE_DEFAULT);
       ioa_network_buffer_set_size(nbh, len);
     }
 
@@ -2207,7 +2534,7 @@ static void tcp_peer_accept_connection(ioa_socket_handle s, void *arg) {
     }
 
     if (!good_peer_addr(server, ss->realm_options.name, peer_addr, ss->id)) {
-      uint8_t saddr[256];
+      char saddr[MAX_IOA_ADDR_STRING] = "";
       addr_to_string(peer_addr, saddr);
       TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: an attempt to connect from a peer with forbidden address: %s\n",
                     __FUNCTION__, saddr);
@@ -2228,7 +2555,11 @@ static void tcp_peer_accept_connection(ioa_socket_handle s, void *arg) {
     int err_code = 0;
     tc = create_tcp_connection(server->id, a, &tid, peer_addr, &err_code);
     if (!tc) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: cannot create TCP connection\n", __FUNCTION__);
+      if (err_code == 508) {
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: TCP connection limit reached\n", __FUNCTION__);
+      } else {
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: cannot create TCP connection\n", __FUNCTION__);
+      }
       close_ioa_socket(s);
       FUNCEND;
       return;
@@ -2319,8 +2650,8 @@ static int handle_turn_connect(turn_turnserver *server, ts_ur_super_session *ss,
           unknown_attrs[(*ua_num)++] = nswap16(attr_type);
         }
       };
-      sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh),
-                                   sar);
+      sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),
+                                           ioa_network_buffer_get_size(in_buffer->nbh), sar);
     }
 
     if (*ua_num > 0) {
@@ -2366,12 +2697,12 @@ static int handle_turn_connection_bind(turn_turnserver *server, ts_ur_super_sess
   } else if (is_allocation_valid(a)) {
 
     *err_code = 400;
-    *reason = (const uint8_t *)"Bad request: CONNECTION_BIND cannot be issued after allocation";
+    *reason = (const uint8_t *)"CONNECTION_BIND cannot be issued after allocation";
 
   } else if (!is_stream_socket(get_ioa_socket_type(ss->client_socket))) {
 
     *err_code = 400;
-    *reason = (const uint8_t *)"Bad request: CONNECTION_BIND only possible with TCP/TLS";
+    *reason = (const uint8_t *)"CONNECTION_BIND only possible with TCP/TLS";
 
   } else {
     tcp_connection_id id = 0;
@@ -2392,7 +2723,7 @@ static int handle_turn_connection_bind(turn_turnserver *server, ts_ur_super_sess
             *err_code = 400;
             *reason = (const uint8_t *)"Wrong Connection ID field data";
           } else {
-            id = *((const uint32_t *)value); // AS-IS encoding, no conversion to/from network byte order
+            memcpy(&id, value, sizeof(id)); // AS-IS encoding, no conversion to/from network byte order
           }
         }
       } break;
@@ -2401,8 +2732,8 @@ static int handle_turn_connection_bind(turn_turnserver *server, ts_ur_super_sess
           unknown_attrs[(*ua_num)++] = nswap16(attr_type);
         }
       };
-      sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh),
-                                   sar);
+      sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),
+                                           ioa_network_buffer_get_size(in_buffer->nbh), sar);
     }
 
     if (*ua_num > 0) {
@@ -2434,7 +2765,7 @@ static int handle_turn_connection_bind(turn_turnserver *server, ts_ur_super_sess
       } else {
         *err_code = 500;
       }
-      ss->to_be_closed = 1;
+      ss->to_be_closed = true;
     }
   }
 
@@ -2445,7 +2776,8 @@ static int handle_turn_connection_bind(turn_turnserver *server, ts_ur_super_sess
     }
 
     size_t len = ioa_network_buffer_get_size(nbh);
-    stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, *err_code, *reason, tid);
+    stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, *err_code, *reason, tid,
+                                 server->include_reason_string);
     ioa_network_buffer_set_size(nbh, len);
 
     *resp_constructed = 1;
@@ -2529,7 +2861,7 @@ int turnserver_accept_tcp_client_data_connection(turn_turnserver *server, tcp_co
       } else {
         size_t len = ioa_network_buffer_get_size(nbh);
         stun_init_error_response_str(STUN_METHOD_CONNECTION_BIND, ioa_network_buffer_data(nbh), &len, err_code, NULL,
-                                     tid);
+                                     tid, server->include_reason_string);
         ioa_network_buffer_set_size(nbh, len);
       }
     }
@@ -2538,8 +2870,8 @@ int turnserver_accept_tcp_client_data_connection(turn_turnserver *server, tcp_co
 
     if (message_integrity && ss) {
       size_t len = ioa_network_buffer_get_size(nbh);
-      stun_attr_add_integrity_str(server->ct, ioa_network_buffer_data(nbh), &len, ss->hmackey, ss->pwd,
-                                  SHATYPE_DEFAULT);
+      turn_attr_add_integrity_key_len_str(server->ct, ioa_network_buffer_data(nbh), &len, ss->hmackey,
+                                          turn_session_hmackey_size(server, ss), ss->pwd, SHATYPE_DEFAULT);
       ioa_network_buffer_set_size(nbh, len);
     }
 
@@ -2593,7 +2925,10 @@ static int handle_turn_channel_bind(turn_turnserver *server, ts_ur_super_session
   if (ss->is_tcp_relay) {
     *err_code = 403;
     *reason = (const uint8_t *)"Channel bind cannot be used with TCP relay";
-  } else if (is_allocation_valid(a)) {
+  } else if (!is_allocation_valid(a)) {
+    *err_code = 437;
+    *reason = (const uint8_t *)"Allocation Mismatch";
+  } else {
 
     stun_attr_ref sar =
         stun_attr_get_first_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh));
@@ -2616,6 +2951,14 @@ static int handle_turn_channel_bind(turn_turnserver *server, ts_ur_super_session
         }
       } break;
       case STUN_ATTRIBUTE_XOR_PEER_ADDRESS: {
+        /* RFC 8489 Section 14: only the first occurrence of a repeated attribute needs
+         * to be processed; duplicates may be ignored. Unlike CreatePermission, which
+         * legitimately carries several peer addresses (RFC 8656 Section 9.2), a channel
+         * binds to exactly one. */
+        if (addr_found) {
+          break;
+        }
+
         stun_attr_get_addr_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh),
                                sar, &peer_addr, NULL);
 
@@ -2624,7 +2967,7 @@ static int handle_turn_channel_bind(turn_turnserver *server, ts_ur_super_session
           *reason = (const uint8_t *)"Peer Address Family Mismatch (3)";
         }
 
-        if (addr_get_port(&peer_addr) < 1) {
+        if (addr_get_port(&peer_addr) == 0) {
           *err_code = 400;
           *reason = (const uint8_t *)"Empty port number in channel bind request";
         } else {
@@ -2638,8 +2981,8 @@ static int handle_turn_channel_bind(turn_turnserver *server, ts_ur_super_session
           unknown_attrs[(*ua_num)++] = nswap16(attr_type);
         }
       };
-      sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh),
-                                   sar);
+      sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),
+                                           ioa_network_buffer_get_size(in_buffer->nbh), sar);
     }
 
     if (*ua_num > 0) {
@@ -2655,7 +2998,7 @@ static int handle_turn_channel_bind(turn_turnserver *server, ts_ur_super_session
       *err_code = 400;
       *reason = (const uint8_t *)"Bad channel bind request";
 
-    } else if (!STUN_VALID_CHANNEL(chnum)) {
+    } else if (!STUN_VALID_CHANNEL_BIND(chnum) && !(*server->rfc5766_channel_numbers && STUN_VALID_CHANNEL(chnum))) {
 
       *err_code = 400;
       *reason = (const uint8_t *)"Bad channel number";
@@ -2716,9 +3059,12 @@ static int handle_turn_channel_bind(turn_turnserver *server, ts_ur_super_session
         if (update_channel_lifetime(ss, chn) < 0) {
           *err_code = 500;
           *reason = (const uint8_t *)"Cannot update channel lifetime (internal error)";
+        } else if (register_multiplex_peer(server, ss, &peer_addr, err_code, reason) < 0) {
+          ;
         } else {
           size_t len = ioa_network_buffer_get_size(nbh);
-          stun_set_channel_bind_response_str(ioa_network_buffer_data(nbh), &len, tid, 0, NULL);
+          stun_set_channel_bind_response_str(ioa_network_buffer_data(nbh), &len, tid, 0, NULL,
+                                             server->include_reason_string);
           ioa_network_buffer_set_size(nbh, len);
           *resp_constructed = 1;
 
@@ -2760,6 +3106,10 @@ static int handle_turn_binding(turn_turnserver *server, ts_ur_super_session *ss,
   uint16_t response_port = 0;
   const SOCKET_TYPE st = get_ioa_socket_type(ss->client_socket);
   int use_reflected_from = 0;
+
+  /* Every incoming Binding request is counted here, exactly once; the matching
+   * response/error is counted where the reply is actually sent out. */
+  stun_report_binding(ss, STUN_PROMETHEUS_METRIC_TYPE_REQUEST);
 
   if (!(ss->client_socket)) {
     return -1;
@@ -2846,23 +3196,18 @@ static int handle_turn_binding(turn_turnserver *server, ts_ur_super_session *ss,
         unknown_attrs[(*ua_num)++] = nswap16(attr_type);
       }
     };
-    sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh),
-                                 sar);
+    sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),
+                                         ioa_network_buffer_get_size(in_buffer->nbh), sar);
   }
 
   if (*ua_num > 0) {
     *err_code = 420;
-    stun_report_binding(ss, STUN_PROMETHEUS_METRIC_TYPE_ERROR);
-  } else if (*err_code) {
-    stun_report_binding(ss, STUN_PROMETHEUS_METRIC_TYPE_ERROR);
-
-  } else if (ss->client_socket && get_remote_addr_from_ioa_socket(ss->client_socket)) {
-    stun_report_binding(ss, STUN_PROMETHEUS_METRIC_TYPE_REQUEST);
+  } else if (!(*err_code) && ss->client_socket && get_remote_addr_from_ioa_socket(ss->client_socket)) {
 
     size_t len = ioa_network_buffer_get_size(nbh);
     if (stun_set_binding_response_str(ioa_network_buffer_data(nbh), &len, tid,
                                       get_remote_addr_from_ioa_socket(ss->client_socket), 0, NULL, cookie, old_stun,
-                                      *server->stun_backward_compatibility)) {
+                                      *server->stun_backward_compatibility, server->include_reason_string)) {
 
       addr_cpy(response_origin, get_local_addr_from_ioa_socket(ss->client_socket));
 
@@ -2886,7 +3231,7 @@ static int handle_turn_binding(turn_turnserver *server, ts_ur_super_session *ss,
             if (change_port) {
               addr_cpy(response_origin, &other_address);
             } else {
-              const int old_port = addr_get_port(response_origin);
+              const uint16_t old_port = addr_get_port(response_origin);
               addr_cpy(response_origin, &other_address);
               addr_set_port(response_origin, old_port);
             }
@@ -2937,7 +3282,7 @@ static int handle_turn_send(turn_turnserver *server, ts_ur_super_session *ss, in
   ioa_addr peer_addr;
   const uint8_t *value = NULL;
   int len = -1;
-  const int addr_found = 0;
+  int addr_found = 0;
   int set_df = 0;
 
   addr_set_any(&peer_addr);
@@ -2966,19 +3311,18 @@ static int handle_turn_send(turn_turnserver *server, ts_ur_super_session *ss, in
         }
         break;
       case STUN_ATTRIBUTE_XOR_PEER_ADDRESS: {
-        if (addr_found) {
-          *err_code = 400;
-          *reason = (const uint8_t *)"Address duplication";
-        } else {
+        /* RFC 8489 Section 14: only the first occurrence of a repeated attribute needs
+         * to be processed; duplicates may be ignored. */
+        if (!addr_found) {
+          addr_found = 1;
           stun_attr_get_addr_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh),
                                  sar, &peer_addr, NULL);
         }
       } break;
       case STUN_ATTRIBUTE_DATA: {
-        if (len >= 0) {
-          *err_code = 400;
-          *reason = (const uint8_t *)"Data duplication";
-        } else {
+        /* RFC 8489 Section 14: only the first occurrence of a repeated attribute needs
+         * to be processed; duplicates may be ignored. */
+        if (len < 0) {
           len = stun_attr_get_len(sar);
           value = stun_attr_get_value(sar);
         }
@@ -2988,8 +3332,8 @@ static int handle_turn_send(turn_turnserver *server, ts_ur_super_session *ss, in
           unknown_attrs[(*ua_num)++] = nswap16(attr_type);
         }
       };
-      sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh),
-                                   sar);
+      sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),
+                                           ioa_network_buffer_get_size(in_buffer->nbh), sar);
     }
 
     if (*err_code) {
@@ -3008,7 +3352,12 @@ static int handle_turn_send(turn_turnserver *server, ts_ur_super_session *ss, in
 
       if (tinfo || (server->server_relay)) {
 
-        set_df_on_ioa_socket(get_relay_socket_ss(ss, peer_addr.ss.sa_family), set_df);
+        if (register_multiplex_peer(server, ss, &peer_addr, err_code, reason) < 0) {
+          return 0;
+        }
+
+        ioa_socket_handle relay_s = get_relay_socket_ss(ss, peer_addr.ss.sa_family);
+        set_df_on_ioa_socket(relay_s, set_df);
 
         ioa_network_buffer_handle nbh = in_buffer->nbh;
         if (value && len > 0) {
@@ -3020,8 +3369,7 @@ static int handle_turn_send(turn_turnserver *server, ts_ur_super_session *ss, in
         }
         ioa_network_buffer_header_init(nbh);
         int skip = 0;
-        send_data_from_ioa_socket_nbh(get_relay_socket_ss(ss, peer_addr.ss.sa_family), &peer_addr, nbh,
-                                      in_buffer->recv_ttl - 1, in_buffer->recv_tos, &skip);
+        send_data_from_ioa_socket_nbh(relay_s, &peer_addr, nbh, in_buffer->recv_ttl - 1, in_buffer->recv_tos, &skip);
         if (!skip) {
           ++(ss->peer_sent_packets);
           ss->peer_sent_bytes += len;
@@ -3122,8 +3470,8 @@ static int handle_turn_create_permission(turn_turnserver *server, ts_ur_super_se
             unknown_attrs[(*ua_num)++] = nswap16(attr_type);
           }
         };
-        sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh),
-                                     ioa_network_buffer_get_size(in_buffer->nbh), sar);
+        sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),
+                                             ioa_network_buffer_get_size(in_buffer->nbh), sar);
       }
     }
 
@@ -3161,17 +3509,21 @@ static int handle_turn_create_permission(turn_turnserver *server, ts_ur_super_se
           stun_attr_get_addr_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh),
                                  sar, &peer_addr, NULL);
 
+          ioa_addr exact_peer_addr = {0};
+          addr_cpy(&exact_peer_addr, &peer_addr);
           addr_set_port(&peer_addr, 0);
           if (update_permission(ss, &peer_addr) < 0) {
             *err_code = 500;
             *reason = (const uint8_t *)"Cannot update some permissions (critical server software error)";
+          } else if (register_multiplex_peer(server, ss, &exact_peer_addr, err_code, reason) < 0) {
+            ;
           }
         } break;
         default:;
         }
 
-        sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh),
-                                     ioa_network_buffer_get_size(in_buffer->nbh), sar);
+        sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),
+                                             ioa_network_buffer_get_size(in_buffer->nbh), sar);
       }
 
       if (*err_code == 0) {
@@ -3204,12 +3556,42 @@ static int need_stun_authentication(turn_turnserver *server, ts_ur_super_session
   return 0;
 }
 
+/* Fill `nonce` (at least NONCE_MAX_SIZE bytes) with the legacy random
+ * challenge nonce: TURN_RANDOM_NONCE_LENGTH lowercase hex chars.
+ *
+ * Each snprintf is bounded by what is left of TURN_RANDOM_NONCE_SIZE, not of
+ * the destination buffer: `%08lx` of a 64-bit draw is up to 16 chars and
+ * `%04x` of a 32-bit draw is 8, so it is the bound that clips every write back
+ * to the 16-char format. Bounding by the (larger) stateless-nonce buffer would
+ * let those digits through and emit a 24-char nonce instead. */
+static void generate_random_challenge_nonce(uint8_t *nonce) {
+  if (TURN_RANDOM_SIZE == 8) {
+    for (int i = 0; i < (NONCE_LENGTH_32BITS >> 1); i++) {
+      uint8_t *s = nonce + 8 * i;
+      const uint64_t rand = (uint64_t)turn_random_number();
+      snprintf((char *)s, TURN_RANDOM_NONCE_SIZE - 8 * i, "%08lx", (unsigned long)rand);
+    }
+  } else {
+    for (int i = 0; i < NONCE_LENGTH_32BITS; i++) {
+      uint8_t *s = nonce + 4 * i;
+      const uint32_t rand = (uint32_t)turn_random_number();
+      snprintf((char *)s, TURN_RANDOM_NONCE_SIZE - 4 * i, "%04x", (unsigned int)rand);
+    }
+  }
+}
+
 static int create_challenge_response(ts_ur_super_session *ss, stun_tid *tid, int *resp_constructed, int *err_code,
                                      const uint8_t **reason, ioa_network_buffer_handle nbh, uint16_t method) {
   size_t len = ioa_network_buffer_get_size(nbh);
-  stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, *err_code, *reason, tid);
+  const turn_turnserver *srv = (const turn_turnserver *)ss->server;
+  stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, *err_code, *reason, tid,
+                               srv ? srv->include_reason_string : false);
   *resp_constructed = 1;
-  stun_attr_add_str(ioa_network_buffer_data(nbh), &len, STUN_ATTRIBUTE_NONCE, ss->nonce, (int)(NONCE_MAX_SIZE - 1));
+  /* strlen, not NONCE_MAX_SIZE - 1: the random nonce (TURN_RANDOM_NONCE_LENGTH
+   * chars) and the stateless timestamp||MAC nonce
+   * (TURN_STATELESS_NONCE_LENGTH) differ in length. */
+  stun_attr_add_str(ioa_network_buffer_data(nbh), &len, STUN_ATTRIBUTE_NONCE, ss->nonce,
+                    (int)strlen((char *)ss->nonce));
   char *realm = ss->realm_options.name;
   stun_attr_add_str(ioa_network_buffer_data(nbh), &len, STUN_ATTRIBUTE_REALM, (uint8_t *)realm,
                     (int)(strlen((char *)(realm))));
@@ -3230,9 +3612,10 @@ static int create_challenge_response(ts_ur_super_session *ss, stun_tid *tid, int
   return 0;
 }
 
-static void resume_processing_after_username_check(int success, int oauth, int max_session_time, hmackey_t hmackey,
-                                                   password_t pwd, turn_turnserver *server, uint64_t ctxkey,
-                                                   ioa_net_data *in_buffer, uint8_t *realm) {
+static void resume_processing_after_username_check(int success, turn_key_lookup_result key_lookup, int oauth,
+                                                   uint64_t oauth_expiration_time, hmackey_t hmackey, password_t pwd,
+                                                   turn_turnserver *server, uint64_t ctxkey, ioa_net_data *in_buffer,
+                                                   uint8_t *realm) {
 
   if (server && in_buffer && in_buffer->nbh) {
 
@@ -3240,11 +3623,24 @@ static void resume_processing_after_username_check(int success, int oauth, int m
     if (ss && ss->client_socket) {
       turn_turnserver *server = (turn_turnserver *)ss->server;
 
+      ss->key_lookup_result = success ? TURN_KEY_LOOKUP_OK : key_lookup;
+
+      if (server->oauth) {
+        uint8_t hash[SHA256_DIGEST_LENGTH] = {0};
+        if (oauth_token_hash(in_buffer->nbh, hash)) {
+          stun_tid_from_message_str(ioa_network_buffer_data(in_buffer->nbh),
+                                    ioa_network_buffer_get_size(in_buffer->nbh), &ss->oauth_lookup_tid);
+          memcpy(ss->oauth_lookup_token_hash, hash, sizeof(hash));
+          ss->oauth_lookup_done = true;
+          ss->oauth_lookup_success = success != 0;
+        }
+      }
+
       if (success) {
         memcpy(ss->hmackey, hmackey, sizeof(hmackey_t));
         ss->hmackey_set = 1;
         ss->oauth = oauth;
-        ss->max_session_time_auth = (turn_time_t)max_session_time;
+        ss->oauth_expiration_time = oauth_expiration_time;
         memcpy(ss->pwd, pwd, sizeof(password_t));
         if (realm && realm[0] && strcmp((char *)realm, ss->realm_options.name)) {
           dec_quota(ss);
@@ -3276,37 +3672,35 @@ static int check_stun_auth(turn_turnserver *server, ts_ur_super_session *ss, stu
     return 0;
   }
 
-  int new_nonce = 0;
+  bool new_nonce = false;
 
   {
-    int generate_new_nonce = 0;
+    bool generate_new_nonce = false;
     if (ss->nonce[0] == 0) {
-      generate_new_nonce = 1;
-      new_nonce = 1;
+      generate_new_nonce = true;
+      new_nonce = true;
     }
 
     if (*(server->stale_nonce)) {
       if (turn_time_before(ss->nonce_expiration_time, server->ctime)) {
-        generate_new_nonce = 1;
+        generate_new_nonce = true;
       }
     }
 
     if (generate_new_nonce) {
 
-      int i = 0;
+      bool need_random_nonce = true;
 
-      if (TURN_RANDOM_SIZE == 8) {
-        for (i = 0; i < (NONCE_LENGTH_32BITS >> 1); i++) {
-          uint8_t *s = ss->nonce + 8 * i;
-          const uint64_t rand = (uint64_t)turn_random_number();
-          snprintf((char *)s, NONCE_MAX_SIZE - 8 * i, "%08lx", (unsigned long)rand);
+      if (turn_server_stateless_nonce_enabled(server)) {
+        const ioa_addr *raddr = get_remote_addr_from_ioa_socket(ss->client_socket);
+        if (raddr && turn_generate_stateless_nonce(server->stateless_nonce_key, server->stateless_nonce_key_size, raddr,
+                                                   (uint32_t)server->ctime, (char *)ss->nonce, sizeof(ss->nonce))) {
+          need_random_nonce = false;
         }
-      } else {
-        for (i = 0; i < NONCE_LENGTH_32BITS; i++) {
-          uint8_t *s = ss->nonce + 4 * i;
-          const uint32_t rand = (uint32_t)turn_random_number();
-          snprintf((char *)s, NONCE_MAX_SIZE - 4 * i, "%04x", (unsigned int)rand);
-        }
+      }
+
+      if (need_random_nonce) {
+        generate_random_challenge_nonce(ss->nonce);
       }
       ss->nonce_expiration_time = server->ctime + *(server->stale_nonce);
     }
@@ -3342,31 +3736,36 @@ static int check_stun_auth(turn_turnserver *server, ts_ur_super_session *ss, stu
 
     /* REALM ATTR: */
 
-    sar = stun_attr_get_first_by_type_str(ioa_network_buffer_data(in_buffer->nbh),
-                                          ioa_network_buffer_get_size(in_buffer->nbh), STUN_ATTRIBUTE_REALM);
+    sar = stun_attr_get_first_covered_by_type_str(ioa_network_buffer_data(in_buffer->nbh),
+                                                  ioa_network_buffer_get_size(in_buffer->nbh), STUN_ATTRIBUTE_REALM);
 
     if (!sar) {
       *err_code = 400;
       return -1;
     }
 
-    alen = min((size_t)stun_attr_get_len(sar), sizeof(realm) - 1);
-    memcpy(realm, stun_attr_get_value(sar), alen);
+    alen = (size_t)stun_attr_get_len(sar);
+    if (alen >= sizeof(realm)) {
+      *err_code = 400;
+      *reason = (const uint8_t *)"Realm is too long";
+      return -1;
+    }
+    if (alen) {
+      memcpy(realm, stun_attr_get_value(sar), alen);
+    }
     realm[alen] = 0;
 
     if (!is_secure_string(realm, 0)) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: %s: wrong realm: %s\n", (unsigned long long)(ss->id),
-                    __FUNCTION__, (char *)realm);
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "wrong realm: %s (session %018llu, %s)\n", (char *)realm,
+                    (unsigned long long)(ss->id), __FUNCTION__);
       realm[0] = 0;
       *err_code = 400;
       return -1;
     }
 
-    if (method == STUN_METHOD_CONNECTION_BIND) {
-
-      get_realm_options_by_name((char *)realm, &(ss->realm_options));
-
-    } else if (strcmp((char *)realm, (char *)(ss->realm_options.name))) {
+    /* RFC 6062 Section 5.4: ConnectionBind carries the allocation's credentials,
+     * so its REALM is checked against the session like every other method's. */
+    if (strcmp((char *)realm, (char *)(ss->realm_options.name))) {
       if (!(ss->oauth)) {
         if (method == STUN_METHOD_ALLOCATE) {
           *err_code = 437;
@@ -3384,21 +3783,28 @@ static int check_stun_auth(turn_turnserver *server, ts_ur_super_session *ss, stu
 
   /* USERNAME ATTR: */
 
-  sar = stun_attr_get_first_by_type_str(ioa_network_buffer_data(in_buffer->nbh),
-                                        ioa_network_buffer_get_size(in_buffer->nbh), STUN_ATTRIBUTE_USERNAME);
+  sar = stun_attr_get_first_covered_by_type_str(ioa_network_buffer_data(in_buffer->nbh),
+                                                ioa_network_buffer_get_size(in_buffer->nbh), STUN_ATTRIBUTE_USERNAME);
 
   if (!sar) {
     *err_code = 400;
     return -1;
   }
 
-  alen = min((size_t)stun_attr_get_len(sar), sizeof(usname) - 1);
-  memcpy(usname, stun_attr_get_value(sar), alen);
+  alen = (size_t)stun_attr_get_len(sar);
+  if (alen >= sizeof(usname)) {
+    *err_code = 400;
+    *reason = (const uint8_t *)"User name is too long";
+    return -1;
+  }
+  if (alen) {
+    memcpy(usname, stun_attr_get_value(sar), alen);
+  }
   usname[alen] = 0;
 
   if (!is_secure_string(usname, 1)) {
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: %s: wrong username: %s\n", (unsigned long long)(ss->id),
-                  __FUNCTION__, (char *)usname);
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "wrong username: %s (session %018llu, %s)\n", (char *)usname,
+                  (unsigned long long)(ss->id), __FUNCTION__);
     usname[0] = 0;
     *err_code = 400;
     return -1;
@@ -3424,24 +3830,59 @@ static int check_stun_auth(turn_turnserver *server, ts_ur_super_session *ss, stu
   {
     /* NONCE ATTR: */
 
-    sar = stun_attr_get_first_by_type_str(ioa_network_buffer_data(in_buffer->nbh),
-                                          ioa_network_buffer_get_size(in_buffer->nbh), STUN_ATTRIBUTE_NONCE);
+    sar = stun_attr_get_first_covered_by_type_str(ioa_network_buffer_data(in_buffer->nbh),
+                                                  ioa_network_buffer_get_size(in_buffer->nbh), STUN_ATTRIBUTE_NONCE);
 
     if (!sar) {
       *err_code = 400;
       return -1;
     }
 
-    alen = min((size_t)stun_attr_get_len(sar), sizeof(nonce) - 1);
-    memcpy(nonce, stun_attr_get_value(sar), alen);
+    alen = (size_t)stun_attr_get_len(sar);
+    if (alen >= sizeof(nonce)) {
+      *err_code = 400;
+      *reason = (const uint8_t *)"Nonce is too long";
+      return -1;
+    }
+    if (alen) {
+      memcpy(nonce, stun_attr_get_value(sar), alen);
+    }
     nonce[alen] = 0;
 
     /* Stale Nonce check: */
 
     if (new_nonce) {
-      *err_code = 438;
-      *reason = (const uint8_t *)"Wrong nonce";
-      return create_challenge_response(ss, tid, resp_constructed, err_code, reason, nbh, method);
+      /* A fresh session has no nonce history. Without stateless nonces the
+       * presented nonce cannot be valid (this session never issued one). With
+       * them, the client may hold a nonce issued by the listener fast path or
+       * by a since-closed challenge session: accept it if its MAC verifies for
+       * this client address and its embedded issue timestamp is within the
+       * nonce lifetime. */
+      bool accepted = false;
+      if (turn_server_stateless_nonce_enabled(server)) {
+        if (!strcmp((char *)ss->nonce, (char *)nonce)) {
+          accepted = true;
+        } else {
+          const ioa_addr *raddr = get_remote_addr_from_ioa_socket(ss->client_socket);
+          uint32_t issued_at = 0;
+          if (raddr && turn_check_stateless_nonce(server->stateless_nonce_key, server->stateless_nonce_key_size, raddr,
+                                                  (uint32_t)server->ctime, turn_server_stateless_nonce_lifetime(server),
+                                                  (const char *)nonce, &issued_at)) {
+            STRCPY(ss->nonce, nonce);
+            if (*(server->stale_nonce)) {
+              /* Expire relative to the nonce's real issue time, matching what
+               * the issuing challenge promised. */
+              ss->nonce_expiration_time = (turn_time_t)issued_at + (turn_time_t)(*(server->stale_nonce));
+            }
+            accepted = true;
+          }
+        }
+      }
+      if (!accepted) {
+        *err_code = 438;
+        *reason = (const uint8_t *)"Wrong nonce";
+        return create_challenge_response(ss, tid, resp_constructed, err_code, reason, nbh, method);
+      }
     }
 
     if (strcmp((char *)ss->nonce, (char *)nonce)) {
@@ -3449,6 +3890,43 @@ static int check_stun_auth(turn_turnserver *server, ts_ur_super_session *ss, stu
       *reason = (const uint8_t *)"Stale nonce";
       return create_challenge_response(ss, tid, resp_constructed, err_code, reason, nbh, method);
     }
+  }
+
+  /* Allocate and Refresh must validate the presented OAuth token, including
+   * after a MAC key has been cached on the session. The lookup is asynchronous;
+   * its callback resumes this same packet once, identified by TID and token. */
+  if (server->oauth && (method == STUN_METHOD_ALLOCATE || method == STUN_METHOD_REFRESH)) {
+    const stun_attr_ref token = stun_attr_get_first_covered_by_type_str(ioa_network_buffer_data(in_buffer->nbh),
+                                                                        ioa_network_buffer_get_size(in_buffer->nbh),
+                                                                        STUN_ATTRIBUTE_OAUTH_ACCESS_TOKEN);
+    if (ss->oauth || token) {
+      if (!token || stun_attr_get_len(token) <= 0) {
+        *err_code = 401;
+        return create_challenge_response(ss, tid, resp_constructed, err_code, reason, nbh, method);
+      }
+      if (oauth_lookup_matches_request(ss, tid, in_buffer->nbh)) {
+        ss->oauth_lookup_done = false;
+        if (!ss->oauth_lookup_success) {
+          *err_code = 401;
+          return create_challenge_response(ss, tid, resp_constructed, err_code, reason, nbh, method);
+        }
+      } else {
+        ss->oauth_lookup_done = false;
+        if (can_resume) {
+          (server->userkeycb)(server->id, server->ct, server->oauth, &(ss->oauth), usname, realm,
+                              resume_processing_after_username_check, in_buffer, ss->id, postpone_reply);
+          if (*postpone_reply) {
+            return 0;
+          }
+        }
+        *err_code = 401;
+        return create_challenge_response(ss, tid, resp_constructed, err_code, reason, nbh, method);
+      }
+    }
+  }
+  if (ss->oauth && !oauth_remaining_lifetime(ss)) {
+    *err_code = 401;
+    return create_challenge_response(ss, tid, resp_constructed, err_code, reason, nbh, method);
   }
 
   /* Password */
@@ -3461,16 +3939,34 @@ static int check_stun_auth(turn_turnserver *server, ts_ur_super_session *ss, stu
       }
     }
 
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: %s: Cannot find credentials of user <%s>\n",
-                  (unsigned long long)(ss->id), __FUNCTION__, (char *)usname);
+    switch (ss->key_lookup_result) {
+    case TURN_KEY_LOOKUP_EXPIRED:
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
+                    "credentials of user <%s> have expired (the time-limited username timestamp is in the past)\n",
+                    (char *)usname);
+      break;
+    case TURN_KEY_LOOKUP_INTEGRITY_MISMATCH:
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
+                    "credentials of user <%s> are wrong (message integrity does not match any auth secret)\n",
+                    (char *)usname);
+      break;
+    default:
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot find credentials of user <%s>\n", (char *)usname);
+      break;
+    }
+    if (server->auth_credential_failure_cb) {
+      server->auth_credential_failure_cb(ss->key_lookup_result);
+    }
+    /* Reset so a later 401 that runs no fresh key lookup cannot report a stale cause. */
+    ss->key_lookup_result = TURN_KEY_LOOKUP_NOT_FOUND;
     *err_code = 401;
     return create_challenge_response(ss, tid, resp_constructed, err_code, reason, nbh, method);
   }
 
   /* Check integrity */
-  if (stun_check_message_integrity_by_key_str(server->ct, ioa_network_buffer_data(in_buffer->nbh),
-                                              ioa_network_buffer_get_size(in_buffer->nbh), ss->hmackey, ss->pwd,
-                                              SHATYPE_DEFAULT) < 1) {
+  if (turn_check_message_integrity_by_key_len_str(
+          server->ct, ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh), ss->hmackey,
+          turn_session_hmackey_size(server, ss), ss->pwd, SHATYPE_DEFAULT) < 1) {
 
     if (can_resume) {
       (server->userkeycb)(server->id, server->ct, server->oauth, &(ss->oauth), usname, realm,
@@ -3480,8 +3976,11 @@ static int check_stun_auth(turn_turnserver *server, ts_ur_super_session *ss, stu
       }
     }
 
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: %s: user %s credentials are incorrect\n",
-                  (unsigned long long)(ss->id), __FUNCTION__, (char *)usname);
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "user %s credentials are incorrect (session %018llu, %s)\n", (char *)usname,
+                  (unsigned long long)(ss->id), __FUNCTION__);
+    if (server->auth_credential_failure_cb) {
+      server->auth_credential_failure_cb(TURN_KEY_LOOKUP_INTEGRITY_MISMATCH);
+    }
     *err_code = 401;
     return create_challenge_response(ss, tid, resp_constructed, err_code, reason, nbh, method);
   }
@@ -3495,7 +3994,7 @@ static int check_stun_auth(turn_turnserver *server, ts_ur_super_session *ss, stu
 
 static void set_alternate_server(turn_server_addrs_list_t *asl, const ioa_addr *local_addr, size_t *counter,
                                  uint16_t method, stun_tid *tid, int *resp_constructed, int *err_code,
-                                 const uint8_t **reason, ioa_network_buffer_handle nbh) {
+                                 const uint8_t **reason, ioa_network_buffer_handle nbh, const turn_turnserver *server) {
   if (asl && asl->size && local_addr) {
 
     size_t i;
@@ -3520,7 +4019,8 @@ static void set_alternate_server(turn_server_addrs_list_t *asl, const ioa_addr *
         *err_code = 300;
 
         size_t len = ioa_network_buffer_get_size(nbh);
-        stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, *err_code, *reason, tid);
+        stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, *err_code, *reason, tid,
+                                     server ? server->include_reason_string : false);
         *resp_constructed = 1;
         stun_attr_add_addr_str(ioa_network_buffer_data(nbh), &len, STUN_ATTRIBUTE_ALTERNATE_SERVER, addr);
         ioa_network_buffer_set_size(nbh, len);
@@ -3544,7 +4044,7 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
     return -1;
   }
 
-  uint16_t unknown_attrs[MAX_NUMBER_OF_UNKNOWN_ATTRS];
+  uint16_t unknown_attrs[MAX_NUMBER_OF_UNKNOWN_ATTRS] = {0};
   uint16_t ua_num = 0;
   const uint16_t method =
       stun_get_method_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh));
@@ -3559,16 +4059,16 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
 
       no_response = 1;
       if (server->verbose) {
-        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: %s: STUN method 0x%x ignored\n",
-                      (unsigned long long)(ss->id), __FUNCTION__, (unsigned int)method);
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "STUN method 0x%x ignored (session %018llu, %s)\n", (unsigned int)method,
+                      (unsigned long long)(ss->id), __FUNCTION__);
       }
 
     } else if ((method != STUN_METHOD_BINDING) && (*(server->stun_only))) {
 
       no_response = 1;
       if (server->verbose) {
-        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: %s: STUN method 0x%x ignored\n",
-                      (unsigned long long)(ss->id), __FUNCTION__, (unsigned int)method);
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "STUN method 0x%x ignored (session %018llu, %s)\n", (unsigned int)method,
+                      (unsigned long long)(ss->id), __FUNCTION__);
       }
 
     } else if ((method != STUN_METHOD_BINDING) || (*(server->secure_stun))) {
@@ -3585,20 +4085,34 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
 
         if (!err_code) {
           const SOCKET_TYPE cst = get_ioa_socket_type(ss->client_socket);
+          size_t *any_counter = &(server->as_counter);
           turn_server_addrs_list_t *asl = server->alternate_servers_list;
 
-          if (((cst == UDP_SOCKET) || (cst == DTLS_SOCKET)) && server->self_udp_balance && server->aux_servers_list &&
-              server->aux_servers_list->size) {
+          /* UDP and DTLS clients share the UDP alternate-server list: DTLS is carried over UDP, and a
+           * DTLS client redirected via ALTERNATE-SERVER keeps speaking DTLS to the new address. When the
+           * UDP list is unset, DTLS falls through to the aux (self-balance) and TLS branches as before. */
+          if (((cst == UDP_SOCKET) || (cst == DTLS_SOCKET)) && server->udp_alternate_servers_list &&
+              server->udp_alternate_servers_list->size) {
+            asl = server->udp_alternate_servers_list;
+            any_counter = &(server->udp_as_counter);
+          } else if ((cst == TCP_SOCKET) && server->tcp_alternate_servers_list &&
+                     server->tcp_alternate_servers_list->size) {
+            asl = server->tcp_alternate_servers_list;
+            any_counter = &(server->tcp_as_counter);
+          } else if (((cst == UDP_SOCKET) || (cst == DTLS_SOCKET)) && server->self_udp_balance &&
+                     server->aux_servers_list && server->aux_servers_list->size) {
             asl = server->aux_servers_list;
+            any_counter = &(server->as_counter);
           } else if (((cst == TLS_SOCKET) || (cst == DTLS_SOCKET) || (cst == TLS_SCTP_SOCKET)) &&
                      server->tls_alternate_servers_list && server->tls_alternate_servers_list->size) {
             asl = server->tls_alternate_servers_list;
+            any_counter = &(server->tls_as_counter);
           }
 
           if (asl && asl->size) {
             TURN_MUTEX_LOCK(&(asl->m));
-            set_alternate_server(asl, get_local_addr_from_ioa_socket(ss->client_socket), &(server->as_counter), method,
-                                 &tid, resp_constructed, &err_code, &reason, nbh);
+            set_alternate_server(asl, get_local_addr_from_ioa_socket(ss->client_socket), any_counter, method, &tid,
+                                 resp_constructed, &err_code, &reason, nbh, server);
             TURN_MUTEX_UNLOCK(&(asl->m));
           }
         }
@@ -3609,7 +4123,7 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
         stun_attr_ref sar = stun_attr_get_first_str(ioa_network_buffer_data(in_buffer->nbh),
                                                     ioa_network_buffer_get_size(in_buffer->nbh));
 
-        int origin_found = 0;
+        bool origin_found = false;
         int norigins = 0;
 
         while (sar && !origin_found) {
@@ -3617,24 +4131,24 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
             const int sarlen = stun_attr_get_len(sar);
             if (sarlen > 0) {
               ++norigins;
-              char *o = (char *)malloc(sarlen + 1);
+              char *o = (char *)turn_malloc(sarlen + 1);
               memcpy(o, stun_attr_get_value(sar), sarlen);
               o[sarlen] = 0;
-              char *corigin = (char *)malloc(STUN_MAX_ORIGIN_SIZE + 1);
+              char *corigin = (char *)turn_malloc(STUN_MAX_ORIGIN_SIZE + 1);
               corigin[0] = 0;
               if (get_canonic_origin(o, corigin, STUN_MAX_ORIGIN_SIZE) < 0) {
-                TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: %s: Wrong origin format: %s\n",
-                              (unsigned long long)(ss->id), __FUNCTION__, o);
+                TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong origin format: %s (session %018llu, %s)\n", o,
+                              (unsigned long long)(ss->id), __FUNCTION__);
               }
               if (!strncmp(ss->origin, corigin, STUN_MAX_ORIGIN_SIZE)) {
-                origin_found = 1;
+                origin_found = true;
               }
               free(corigin);
               free(o);
             }
           }
-          sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh),
-                                       ioa_network_buffer_get_size(in_buffer->nbh), sar);
+          sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),
+                                               ioa_network_buffer_get_size(in_buffer->nbh), sar);
         }
 
         if (server->check_origin && *(server->check_origin)) {
@@ -3643,7 +4157,8 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
               err_code = 441;
               reason = (const uint8_t *)"The origin attribute does not match the initial session origin value";
               if (server->verbose) {
-                char smethod[129];
+                // STUN_METHOD_STR_MAX=32
+                char smethod[32];
                 stun_method_str(method, smethod);
                 log_method(ss, smethod, err_code, reason);
               }
@@ -3652,7 +4167,8 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
             err_code = 441;
             reason = (const uint8_t *)"The origin attribute is empty, does not match the initial session origin value";
             if (server->verbose) {
-              char smethod[129];
+              // STUN_METHOD_STR_MAX=32
+              char smethod[32];
               stun_method_str(method, smethod);
               log_method(ss, smethod, err_code, reason);
             }
@@ -3666,20 +4182,20 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
         stun_attr_ref sar = stun_attr_get_first_str(ioa_network_buffer_data(in_buffer->nbh),
                                                     ioa_network_buffer_get_size(in_buffer->nbh));
 
-        int origin_found = 0;
+        bool origin_found = false;
 
         while (sar && !origin_found) {
           if (stun_attr_get_type(sar) == STUN_ATTRIBUTE_ORIGIN) {
             const int sarlen = stun_attr_get_len(sar);
             if (sarlen > 0) {
-              char *o = (char *)malloc(sarlen + 1);
+              char *o = (char *)turn_malloc(sarlen + 1);
               memcpy(o, stun_attr_get_value(sar), sarlen);
               o[sarlen] = 0;
-              char *corigin = (char *)malloc(STUN_MAX_ORIGIN_SIZE + 1);
+              char *corigin = (char *)turn_malloc(STUN_MAX_ORIGIN_SIZE + 1);
               corigin[0] = 0;
               if (get_canonic_origin(o, corigin, STUN_MAX_ORIGIN_SIZE) < 0) {
-                TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: %s: Wrong origin format: %s\n",
-                              (unsigned long long)(ss->id), __FUNCTION__, o);
+                TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong origin format: %s (session %018llu, %s)\n", o,
+                              (unsigned long long)(ss->id), __FUNCTION__);
               }
               strncpy(ss->origin, corigin, STUN_MAX_ORIGIN_SIZE);
               free(corigin);
@@ -3687,11 +4203,13 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
               origin_found = get_realm_options_by_origin(ss->origin, &(ss->realm_options));
             }
           }
-          sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh),
-                                       ioa_network_buffer_get_size(in_buffer->nbh), sar);
+          sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),
+                                               ioa_network_buffer_get_size(in_buffer->nbh), sar);
         }
-
-        ss->origin_set = 1;
+        /* Note: ss->origin_set is intentionally NOT committed here. We pin the origin only
+           after the request's MESSAGE-INTEGRITY validates (see post-auth block below). An
+           unauthenticated first ALLOCATE could otherwise lock the session into a realm of
+           the attacker's choice. Until auth succeeds, every request re-parses the origin. */
       }
 
       if (!err_code && !(*resp_constructed) && !no_response) {
@@ -3704,6 +4222,10 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
                           &message_integrity, &postpone_reply, can_resume);
           if (postpone_reply) {
             no_response = 1;
+          }
+          /* Pin origin only after the request was authenticated (MESSAGE-INTEGRITY validated). */
+          if (!err_code && message_integrity && (method == STUN_METHOD_ALLOCATE)) {
+            ss->origin_set = 1;
           }
         }
       }
@@ -3799,7 +4321,7 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
         if (*resp_constructed && !err_code && (origin_changed || dest_changed)) {
 
           if (server->verbose && *(server->log_binding)) {
-            TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: RFC 5780 request successfully processed\n",
+            TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "RFC 5780 request successfully processed (session %018llu)\n",
                           (unsigned long long)(ss->id));
           }
 
@@ -3813,8 +4335,8 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
         break;
       }
       default:
-        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: Unsupported STUN request received, method 0x%x\n",
-                      (unsigned long long)(ss->id), (unsigned int)method);
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Unsupported STUN request received, method 0x%x (session %018llu)\n",
+                      (unsigned int)method, (unsigned long long)(ss->id));
       };
     }
 
@@ -3854,8 +4376,8 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
 
       default:
         if (server->verbose) {
-          TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: Unsupported STUN indication received: method 0x%x\n",
-                        (unsigned long long)(ss->id), (unsigned int)method);
+          TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Unsupported STUN indication received: method 0x%x (session %018llu)\n",
+                        (unsigned int)method, (unsigned long long)(ss->id));
         }
       }
     };
@@ -3865,7 +4387,7 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
     no_response = 1;
 
     if (server->verbose) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: Wrong STUN message received\n",
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Wrong STUN message received (session %018llu)\n",
                     (unsigned long long)(ss->id));
     }
   }
@@ -3874,12 +4396,13 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
     return 0;
   }
 
-  if (ua_num > 0) {
+  if (ua_num > 0 && nbh) {
 
     err_code = 420;
 
     size_t len = ioa_network_buffer_get_size(nbh);
-    stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, err_code, NULL, &tid);
+    stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, err_code, NULL, &tid,
+                                 server->include_reason_string);
 
     stun_attr_add_str(ioa_network_buffer_data(nbh), &len, STUN_ATTRIBUTE_UNKNOWN_ATTRIBUTES,
                       (const uint8_t *)unknown_attrs, (ua_num * 2));
@@ -3887,6 +4410,25 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
     ioa_network_buffer_set_size(nbh, len);
 
     *resp_constructed = 1;
+  }
+  /* UDP 401 responses are the reflection surface. Metrics cover the
+   * response decision even when mitigation is disabled. */
+  if (err_code == 401 && !no_response && get_ioa_socket_type(ss->client_socket) == UDP_SOCKET) {
+    if (server->unauthenticated_401_request_cb) {
+      server->unauthenticated_401_request_cb();
+    }
+    if (turn_server_unauthenticated_reply_suppressed(server, get_remote_addr_from_ioa_socket(ss->client_socket), 401)) {
+      no_response = 1;
+      /* Stateless-nonce mode: a suppressed challenge leaves nothing for this
+       * session to do — the client will retry and be re-challenged from
+       * scratch — so drop the session state right away instead of letting it
+       * sit out the to-be-allocated timeout. */
+      if (turn_server_stateless_nonce_enabled(server) && !is_allocation_valid(get_allocation_ss(ss))) {
+        ss->to_be_closed = true;
+      }
+    } else if (server->unauthenticated_401_response_cb) {
+      server->unauthenticated_401_response_cb();
+    }
   }
 
   if (!no_response) {
@@ -3898,7 +4440,8 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
       }
 
       size_t len = ioa_network_buffer_get_size(nbh);
-      stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, err_code, reason, &tid);
+      stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, err_code, reason, &tid,
+                                   server->include_reason_string);
       ioa_network_buffer_set_size(nbh, len);
       *resp_constructed = 1;
     }
@@ -3907,9 +4450,13 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
 
     if (message_integrity) {
       size_t len = ioa_network_buffer_get_size(nbh);
-      stun_attr_add_integrity_str(server->ct, ioa_network_buffer_data(nbh), &len, ss->hmackey, ss->pwd,
-                                  SHATYPE_DEFAULT);
+      turn_attr_add_integrity_key_len_str(server->ct, ioa_network_buffer_data(nbh), &len, ss->hmackey,
+                                          turn_session_hmackey_size(server, ss), ss->pwd, SHATYPE_DEFAULT);
       ioa_network_buffer_set_size(nbh, len);
+    }
+
+    if (method == STUN_METHOD_BINDING) {
+      stun_report_binding(ss, err_code ? STUN_PROMETHEUS_METRIC_TYPE_ERROR : STUN_PROMETHEUS_METRIC_TYPE_RESPONSE);
     }
 
     if (err_code) {
@@ -3920,6 +4467,19 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
 
   } else {
     *resp_constructed = 0;
+  }
+
+  /* Stateless-nonce mode: a UDP session that only carried an auth challenge
+   * holds no state the client's retry will need (the nonce is recomputable),
+   * so schedule it for teardown once the challenge has been written. This is
+   * what bounds memory under spoofed-source floods that carry a (garbage)
+   * MESSAGE-INTEGRITY and therefore bypass the listener fast path. Sessions
+   * with a live allocation (e.g. an established client answering a stale-nonce
+   * challenge) are never torn down here. */
+  if (((err_code == 401) || (err_code == 438)) && *resp_constructed && !no_response &&
+      turn_server_stateless_nonce_enabled(server) && (get_ioa_socket_type(ss->client_socket) == UDP_SOCKET) &&
+      !is_allocation_valid(get_allocation_ss(ss))) {
+    ss->close_after_auth_challenge = true;
   }
 
   return 0;
@@ -3933,7 +4493,7 @@ static int handle_old_stun_command(turn_turnserver *server, ts_ur_super_session 
   const uint8_t *reason = NULL;
   int no_response = 0;
 
-  uint16_t unknown_attrs[MAX_NUMBER_OF_UNKNOWN_ATTRS];
+  uint16_t unknown_attrs[MAX_NUMBER_OF_UNKNOWN_ATTRS] = {0};
   uint16_t ua_num = 0;
   const uint16_t method =
       stun_get_method_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh));
@@ -3978,13 +4538,14 @@ static int handle_old_stun_command(turn_turnserver *server, ts_ur_super_session 
           if (newsz > sizeof(software)) {
             newsz = sizeof(software);
           }
-          memcpy(software, get_version(server), oldsz);
+          memcpy(software, get_version(server), min(oldsz, sizeof(software)));
           size_t len = ioa_network_buffer_get_size(nbh);
           stun_attr_add_str(ioa_network_buffer_data(nbh), &len, OLD_STUN_ATTRIBUTE_SERVER, software, newsz);
           ioa_network_buffer_set_size(nbh, len);
         }
 
         send_turn_message_to(server, nbh, &response_origin, &response_destination);
+        stun_report_binding(ss, STUN_PROMETHEUS_METRIC_TYPE_RESPONSE);
 
         no_response = 1;
       }
@@ -4003,7 +4564,8 @@ static int handle_old_stun_command(turn_turnserver *server, ts_ur_super_session 
     err_code = 420;
 
     size_t len = ioa_network_buffer_get_size(nbh);
-    old_stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, err_code, NULL, &tid, cookie);
+    old_stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, err_code, NULL, &tid, cookie,
+                                     server->include_reason_string);
 
     stun_attr_add_str(ioa_network_buffer_data(nbh), &len, STUN_ATTRIBUTE_UNKNOWN_ATTRIBUTES,
                       (const uint8_t *)unknown_attrs, (ua_num * 2));
@@ -4022,7 +4584,8 @@ static int handle_old_stun_command(turn_turnserver *server, ts_ur_super_session 
       }
 
       size_t len = ioa_network_buffer_get_size(nbh);
-      old_stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, err_code, reason, &tid, cookie);
+      old_stun_init_error_response_str(method, ioa_network_buffer_data(nbh), &len, err_code, reason, &tid, cookie,
+                                       server->include_reason_string);
       ioa_network_buffer_set_size(nbh, len);
       *resp_constructed = 1;
     }
@@ -4034,10 +4597,14 @@ static int handle_old_stun_command(turn_turnserver *server, ts_ur_super_session 
       if (newsz > sizeof(software)) {
         newsz = sizeof(software);
       }
-      memcpy(software, get_version(server), oldsz);
+      memcpy(software, get_version(server), min(oldsz, sizeof(software)));
       size_t len = ioa_network_buffer_get_size(nbh);
       stun_attr_add_str(ioa_network_buffer_data(nbh), &len, OLD_STUN_ATTRIBUTE_SERVER, software, newsz);
       ioa_network_buffer_set_size(nbh, len);
+    }
+
+    if (method == STUN_METHOD_BINDING) {
+      stun_report_binding(ss, err_code ? STUN_PROMETHEUS_METRIC_TYPE_ERROR : STUN_PROMETHEUS_METRIC_TYPE_RESPONSE);
     }
 
     if (err_code) {
@@ -4071,23 +4638,26 @@ static int write_to_peerchannel(ts_ur_super_session *ss, uint16_t chnum, ioa_net
         return -1;
       }
 
-      /* Channel packets are always sent with DF=0: */
-      set_df_on_ioa_socket(get_relay_socket_ss(ss, chn->peer_addr.ss.sa_family), 0);
-
+      /* Cache relay socket and buffer-size lookups that were each called twice
+       * per channel-data packet on the hot path. */
+      ioa_socket_handle relay_s = get_relay_socket_ss(ss, chn->peer_addr.ss.sa_family);
       ioa_network_buffer_handle nbh = in_buffer->nbh;
+      const size_t in_size = ioa_network_buffer_get_size(nbh);
 
-      ioa_network_buffer_add_offset_size(in_buffer->nbh, STUN_CHANNEL_HEADER_LENGTH, 0,
-                                         ioa_network_buffer_get_size(in_buffer->nbh) - STUN_CHANNEL_HEADER_LENGTH);
+      /* Channel packets are always sent with DF=0: */
+      set_df_on_ioa_socket(relay_s, 0);
+
+      ioa_network_buffer_add_offset_size(nbh, STUN_CHANNEL_HEADER_LENGTH, 0, in_size - STUN_CHANNEL_HEADER_LENGTH);
 
       ioa_network_buffer_header_init(nbh);
 
       int skip = 0;
-      rc = send_data_from_ioa_socket_nbh(get_relay_socket_ss(ss, chn->peer_addr.ss.sa_family), &(chn->peer_addr), nbh,
-                                         in_buffer->recv_ttl - 1, in_buffer->recv_tos, &skip);
+      rc = send_data_from_ioa_socket_nbh(relay_s, &(chn->peer_addr), nbh, in_buffer->recv_ttl - 1, in_buffer->recv_tos,
+                                         &skip);
 
       if (!skip && rc > -1) {
         ++(ss->peer_sent_packets);
-        ss->peer_sent_bytes += (uint32_t)ioa_network_buffer_get_size(in_buffer->nbh);
+        ss->peer_sent_bytes += (uint32_t)in_size;
         turn_report_session_usage(ss, 0);
       }
 
@@ -4118,28 +4688,33 @@ int shutdown_client_connection(turn_turnserver *server, ts_ur_super_session *ss,
   const SOCKET_TYPE socket_type = get_ioa_socket_type(ss->client_socket);
 
   turn_report_session_usage(ss, 1);
-  dec_quota(ss);
-  dec_bps(ss);
 
   allocation *alloc = get_allocation_ss(ss);
   if (!is_allocation_valid(alloc)) {
     force = 1;
   }
 
+  /* A first-stage mobility close only suspends the session: it keeps the
+   * allocation, relay socket, and mobility ticket alive for a later resume.
+   * The allocation and bandwidth quota charge must stay held for as long as the
+   * allocation remains resumable; releasing it here would let an authenticated
+   * client disconnect and immediately re-allocate past --user-quota /
+   * --total-quota. The charge is released only in the
+   * final (2nd stage) teardown below. */
   if (!force && ss->is_mobile) {
 
     if (ss->client_socket && server->verbose) {
 
-      char sraddr[129] = "\0";
-      char sladdr[129] = "\0";
-      addr_to_string(get_remote_addr_from_ioa_socket(ss->client_socket), (uint8_t *)sraddr);
-      addr_to_string(get_local_addr_from_ioa_socket(ss->client_socket), (uint8_t *)sladdr);
+      char sraddr[MAX_IOA_ADDR_STRING] = "";
+      char sladdr[MAX_IOA_ADDR_STRING] = "";
+      addr_to_string(get_remote_addr_from_ioa_socket(ss->client_socket), sraddr);
+      addr_to_string(get_local_addr_from_ioa_socket(ss->client_socket), sladdr);
 
       TURN_LOG_FUNC(
           TURN_LOG_LEVEL_INFO,
-          "session %018llu: closed (1st stage), user <%s> realm <%s> origin <%s>, local %s, remote %s, reason: %s\n",
-          (unsigned long long)(ss->id), (char *)ss->username, (char *)ss->realm_options.name, (char *)ss->origin,
-          sladdr, sraddr, reason);
+          "closed (1st stage), user <%s> realm <%s> origin <%s>, local %s, remote %s, reason: %s (session %018llu)\n",
+          (char *)ss->username, (char *)ss->realm_options.name, (char *)ss->origin, sladdr, sraddr, reason,
+          (unsigned long long)(ss->id));
     }
 
     IOA_CLOSE_SOCKET(ss->client_socket);
@@ -4147,6 +4722,32 @@ int shutdown_client_connection(turn_turnserver *server, ts_ur_super_session *ss,
     FUNCEND;
 
     return 0;
+  }
+
+  /* Final teardown: the allocation is gone, so release its quota and bandwidth
+   * charge now (a first-stage mobility close returned above without releasing). */
+  dec_quota(ss);
+  dec_bps(ss);
+
+  /* RFC 8016 mobility handoff: this session is being freed. If it is part of a
+   * transition, unlink its peer so a surviving allocation session doesn't wait
+   * on a dead pending resume (and vice versa). */
+  if (ss->mobile_resume_target) {
+    ts_ur_super_session *tgt = get_session_from_map(server, ss->mobile_resume_target);
+    if (tgt && tgt->mobile_pending_resume == ss->id) {
+      tgt->mobile_pending_resume = 0;
+      tgt->mobile_transition_deadline = 0;
+    }
+    ss->mobile_resume_target = 0;
+  }
+  if (ss->mobile_pending_resume) {
+    ts_ur_super_session *pend = get_session_from_map(server, ss->mobile_pending_resume);
+    if (pend && pend->mobile_resume_target == ss->id) {
+      pend->mobile_resume_target = 0;
+      pend->to_be_closed = true;
+    }
+    ss->mobile_pending_resume = 0;
+    ss->mobile_transition_deadline = 0;
   }
 
   if (eve(server->verbose)) {
@@ -4160,20 +4761,37 @@ int shutdown_client_connection(turn_turnserver *server, ts_ur_super_session *ss,
 
   if (server->verbose) {
 
-    char sraddr[129] = "\0";
-    char sladdr[129] = "\0";
-    addr_to_string(get_remote_addr_from_ioa_socket(ss->client_socket), (uint8_t *)sraddr);
-    addr_to_string(get_local_addr_from_ioa_socket(ss->client_socket), (uint8_t *)sladdr);
+    char sraddr[MAX_IOA_ADDR_STRING] = "";
+    char sladdr[MAX_IOA_ADDR_STRING] = "";
+    addr_to_string(get_remote_addr_from_ioa_socket(ss->client_socket), sraddr);
+    addr_to_string(get_local_addr_from_ioa_socket(ss->client_socket), sladdr);
 
     TURN_LOG_FUNC(
         TURN_LOG_LEVEL_INFO,
-        "session %018llu: closed (2nd stage), user <%s> realm <%s> origin <%s>, local %s, remote %s, reason: %s\n",
-        (unsigned long long)(ss->id), (char *)ss->username, (char *)ss->realm_options.name, (char *)ss->origin, sladdr,
-        sraddr, reason);
+        "closed (2nd stage), user <%s> realm <%s> origin <%s>, local %s, remote %s, reason: %s (session %018llu)\n",
+        (char *)ss->username, (char *)ss->realm_options.name, (char *)ss->origin, sladdr, sraddr, reason,
+        (unsigned long long)(ss->id));
   }
 
-  IOA_CLOSE_SOCKET(ss->client_socket);
   {
+    if (server->multiplex_peer_mode) {
+      /*
+       * Remove all exact-peer demux entries for this session, then null out
+       * shared socket pointers so IOA_CLOSE_SOCKET below is a no-op for them.
+       */
+      mp_deregister_session_peers(server->e, ss, 0);
+      for (int af = AF_INET;; af = AF_INET6) {
+        relay_endpoint_session *res = get_relay_session_ss(ss, af);
+        if (res && res->s == mp_get_socket(server->e, af)) {
+          res->s = NULL;
+          res->owner = NULL;
+        }
+        if (af == AF_INET6) {
+          break;
+        }
+      }
+    }
+    IOA_CLOSE_SOCKET(ss->client_socket);
     int i;
     for (i = 0; i < ALLOC_PROTOCOLS_NUMBER; ++i) {
       IOA_CLOSE_SOCKET(ss->alloc.relay_sessions[i].s);
@@ -4255,12 +4873,15 @@ static int write_client_connection(turn_turnserver *server, ts_ur_super_session 
       TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s: prepare to write to s %p\n", __FUNCTION__, ss->client_socket);
     }
 
+    /* send_data_from_ioa_socket_nbh() may release nbh, so take its size first. */
+    const uint32_t bytes = (uint32_t)ioa_network_buffer_get_size(nbh);
+
     int skip = 0;
     const int ret = send_data_from_ioa_socket_nbh(ss->client_socket, NULL, nbh, ttl, tos, &skip);
 
     if (!skip && ret > -1) {
       ++(ss->sent_packets);
-      ss->sent_bytes += (uint32_t)ioa_network_buffer_get_size(nbh);
+      ss->sent_bytes += bytes;
       turn_report_session_usage(ss, 0);
     }
 
@@ -4284,6 +4905,9 @@ static void client_ss_allocation_timeout_handler(ioa_engine_handle e, void *arg)
   }
 
   ts_ur_super_session *ss = get_ioa_socket_session(rsession->s);
+  if (!ss && rsession->owner) {
+    ss = (ts_ur_super_session *)rsession->owner;
+  }
 
   if (!ss) {
     return;
@@ -4302,7 +4926,14 @@ static void client_ss_allocation_timeout_handler(ioa_engine_handle e, void *arg)
 
   const int family = get_ioa_socket_address_family(rsession->s);
 
-  set_allocation_family_invalid(a, family);
+  if (is_multiplex_peer_udp_relay(server, rsession->s)) {
+    mp_deregister_session_peers(server->e, ss, family);
+    IOA_EVENT_DEL(rsession->lifetime_ev);
+    rsession->s = NULL;
+    rsession->owner = NULL;
+  } else {
+    set_allocation_family_invalid(a, family);
+  }
 
   if (!get_relay_socket(a, AF_INET) && !get_relay_socket(a, AF_INET6)) {
     shutdown_client_connection(server, ss, 0, "allocation timeout");
@@ -4321,6 +4952,13 @@ static int create_relay_connection(turn_turnserver *server, ts_ur_super_session 
     allocation *a = get_allocation_ss(ss);
     relay_endpoint_session *newelem = NULL;
     ioa_socket_handle rtcp_s = NULL;
+    const bool multiplex_peer_udp = server->multiplex_peer_mode && transport == STUN_ATTRIBUTE_TRANSPORT_UDP_VALUE;
+
+    if (multiplex_peer_udp && in_reservation_token) {
+      *err_code = 400;
+      *reason = (const uint8_t *)"Reservation tokens are not supported with multiplex-peer";
+      return -1;
+    }
 
     if (in_reservation_token) {
 
@@ -4354,20 +4992,27 @@ static int create_relay_connection(turn_turnserver *server, ts_ur_super_session 
 
       newelem = get_relay_session_ss(ss, family);
 
-      IOA_CLOSE_SOCKET(newelem->s);
+      if (newelem->s == mp_get_socket(server->e, family)) {
+        newelem->s = NULL;
+      } else {
+        IOA_CLOSE_SOCKET(newelem->s);
+      }
 
       memset(newelem, 0, sizeof(relay_endpoint_session));
       newelem->s = NULL;
 
-      const int res =
-          create_relay_ioa_sockets(server->e, ss->client_socket, address_family, transport, even_port, &(newelem->s),
-                                   &rtcp_s, out_reservation_token, err_code, reason, acb, ss);
+      const int res = create_relay_ioa_sockets(server->e, ss->client_socket, address_family, transport, even_port,
+                                               &(newelem->s), &rtcp_s, out_reservation_token, err_code, reason, acb, ss,
+                                               server->multiplex_peer_mode);
       if (res < 0) {
         if (!(*err_code)) {
           *err_code = 508;
         }
         if (!(*reason)) {
           *reason = (const uint8_t *)"Cannot create socket";
+        }
+        if (multiplex_peer_udp && newelem->s == mp_get_socket(server->e, family)) {
+          newelem->s = NULL;
         }
         IOA_CLOSE_SOCKET(newelem->s);
         IOA_CLOSE_SOCKET(rtcp_s);
@@ -4377,6 +5022,7 @@ static int create_relay_connection(turn_turnserver *server, ts_ur_super_session 
 
     if (newelem->s) {
       set_ioa_socket_buf_size(newelem->s, server->sock_buf_size);
+      newelem->owner = ss;
     }
     if (rtcp_s) {
       set_ioa_socket_buf_size(rtcp_s, server->sock_buf_size);
@@ -4407,7 +5053,7 @@ static int create_relay_connection(turn_turnserver *server, ts_ur_super_session 
       set_do_not_use_df(newelem->s);
     }
 
-    if (get_ioa_socket_type(newelem->s) != TCP_SOCKET) {
+    if (get_ioa_socket_type(newelem->s) != TCP_SOCKET && !multiplex_peer_udp) {
       if (register_callback_on_ioa_socket(server->e, newelem->s, IOA_EV_READ, peer_input_handler, ss, 0) < 0) {
         IOA_CLOSE_SOCKET(newelem->s);
         IOA_CLOSE_SOCKET(rtcp_s);
@@ -4427,7 +5073,9 @@ static int create_relay_connection(turn_turnserver *server, ts_ur_super_session 
                                         "client_ss_allocation_timeout_handler");
     set_allocation_lifetime_ev(a, server->ctime + lifetime, ev, get_ioa_socket_address_family(newelem->s));
 
-    set_ioa_socket_session(newelem->s, ss);
+    if (!multiplex_peer_udp) {
+      set_ioa_socket_session(newelem->s, ss);
+    }
   }
 
   return 0;
@@ -4474,28 +5122,45 @@ static int read_client_connection(turn_turnserver *server, ts_ur_super_session *
     return -1;
   }
 
+  /* RFC 8016 mobility handoff: this is the client's first packet on the new
+   * 5-tuple after a resume. Complete the transition now — promote the allocation
+   * onto this socket and process the packet against the allocation session.
+   * Peer->client relayed traffic stayed on the old 5-tuple up to this point
+   * (make-before-break); the client's activity here is what ends that window
+   * (RFC 8016 uses the first Send/ChannelData as the trigger — we also promote
+   * on control requests such as CreatePermission/ChannelBind so they are served
+   * by the allocation rather than the pending session). */
+  if (ss->mobile_resume_target) {
+    ts_ur_super_session *promoted = mobile_complete_transition(server, ss);
+    if (promoted) {
+      ss = promoted;
+    }
+  }
+
   const int ret = (int)ioa_network_buffer_get_size(in_buffer->nbh);
   if (ret < 0) {
     FUNCEND;
     return -1;
   }
+  /* Cross-TU helper that just reads buf->len; cache once and reuse instead of
+   * calling four times per packet. */
+  const size_t orig_blen = (size_t)ret;
 
   if (count_usage) {
     ++(ss->received_packets);
-    ss->received_bytes += (uint32_t)ioa_network_buffer_get_size(in_buffer->nbh);
+    ss->received_bytes += (uint32_t)orig_blen;
     turn_report_session_usage(ss, 0);
   }
 
   if (eve(server->verbose)) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s: data.buffer=%p, data.len=%ld\n", __FUNCTION__,
-                  ioa_network_buffer_data(in_buffer->nbh), (long)ioa_network_buffer_get_size(in_buffer->nbh));
+                  ioa_network_buffer_data(in_buffer->nbh), (long)orig_blen);
   }
 
   uint16_t chnum = 0;
   uint32_t old_stun_cookie = 0;
 
-  size_t blen = ioa_network_buffer_get_size(in_buffer->nbh);
-  const size_t orig_blen = blen;
+  size_t blen = orig_blen;
   const SOCKET_TYPE st = get_ioa_socket_type(ss->client_socket);
   const SOCKET_APP_TYPE sat = get_ioa_socket_app_type(ss->client_socket);
   const int is_padding_mandatory = is_stream_socket(st);
@@ -4503,6 +5168,7 @@ static int read_client_connection(turn_turnserver *server, ts_ur_super_session *
   if (sat == HTTP_CLIENT_SOCKET) {
 
     if (server->verbose) {
+      ((char *)ioa_network_buffer_data(in_buffer->nbh))[ioa_network_buffer_get_size(in_buffer->nbh)] = 0;
       TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s: HTTP connection input: %s\n", __FUNCTION__,
                     (char *)ioa_network_buffer_data(in_buffer->nbh));
     }
@@ -4537,14 +5203,19 @@ static int read_client_connection(turn_turnserver *server, ts_ur_super_session *
     return 0;
 
   } else if (stun_is_command_message_full_check_str(ioa_network_buffer_data(in_buffer->nbh),
-                                                    ioa_network_buffer_get_size(in_buffer->nbh), 0,
+                                                    ioa_network_buffer_get_size(in_buffer->nbh), false,
                                                     &(ss->enforce_fingerprints))) {
 
-    ioa_network_buffer_handle nbh = ioa_network_buffer_allocate(server->e);
     int resp_constructed = 0;
 
     const uint16_t method =
         stun_get_method_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh));
+
+    const int is_indication =
+        stun_is_indication_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh));
+
+    /* Indications never produce a response, so skip the response buffer allocation. */
+    ioa_network_buffer_handle nbh = is_indication ? NULL : ioa_network_buffer_allocate(server->e);
 
     handle_turn_command(server, ss, in_buffer, nbh, &resp_constructed, can_resume);
 
@@ -4572,6 +5243,11 @@ static int read_client_connection(turn_turnserver *server, ts_ur_super_session *
 
       const int ret = write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE);
 
+      if (ss->close_after_auth_challenge) {
+        ss->close_after_auth_challenge = false;
+        ss->to_be_closed = true;
+      }
+
       FUNCEND;
       return ret;
     } else {
@@ -4581,7 +5257,7 @@ static int read_client_connection(turn_turnserver *server, ts_ur_super_session *
 
   } else if (old_stun_is_command_message_str(ioa_network_buffer_data(in_buffer->nbh),
                                              ioa_network_buffer_get_size(in_buffer->nbh), &old_stun_cookie) &&
-             !(*(server->no_stun)) && !(*(server->stun_backward_compatibility))) {
+             !(*(server->no_stun)) && *(server->rfc3489_compatibility)) {
 
     ioa_network_buffer_handle nbh = ioa_network_buffer_allocate(server->e);
     int resp_constructed = 0;
@@ -4608,7 +5284,7 @@ static int read_client_connection(turn_turnserver *server, ts_ur_super_session *
         if ((st == TCP_SOCKET) && (try_acme_redirect((char *)ioa_network_buffer_data(in_buffer->nbh),
                                                      ioa_network_buffer_get_size(in_buffer->nbh), server->acme_redirect,
                                                      ss->client_socket) == 0)) {
-          ss->to_be_closed = 1;
+          ss->to_be_closed = true;
           return 0;
         } else if (*server->web_admin_listen_on_workers) {
           if (st == TLS_SOCKET) {
@@ -4626,7 +5302,7 @@ static int read_client_connection(turn_turnserver *server, ts_ur_super_session *
                               get_ioa_socket_type(new_s), get_ioa_socket_app_type(new_s));
                 server->send_https_socket(new_s);
               }
-              ss->to_be_closed = 1;
+              ss->to_be_closed = true;
             }
           } else {
             set_ioa_socket_app_type(ss->client_socket, HTTP_CLIENT_SOCKET);
@@ -4668,7 +5344,7 @@ static int read_client_connection(turn_turnserver *server, ts_ur_super_session *
           memcpy(ioa_network_buffer_data(nbh_http), buffer, strlen(buffer));
           send_data_from_ioa_socket_nbh(ss->client_socket, NULL, nbh_http, TTL_IGNORE, TOS_IGNORE, NULL);
         } else {
-          ss->to_be_closed = 1;
+          ss->to_be_closed = true;
           return 0;
         }
       }
@@ -4708,6 +5384,52 @@ static int attach_socket_to_session(turn_turnserver *server, ioa_socket_handle s
   return ret;
 }
 
+bool turn_should_reap_unallocated_noauth_udp(const turn_turnserver *server, const ts_ur_super_session *ss) {
+  if (!server || !ss || !ss->client_socket) {
+    return false;
+  }
+  /* A non-long-term UDP session stores no challenge nonce. If this first
+   * datagram did not create an allocation, the to-be-allocated watchdog would
+   * hold the session for TURN_MAX_ALLOCATE_TIMEOUT with nothing to resume. A
+   * mobility resume is the exception: the new 5-tuple stays linked to the
+   * allocation that still lives on the original session. */
+  if (ss->to_be_closed || ioa_socket_tobeclosed(ss->client_socket)) {
+    return false;
+  }
+  if (get_ioa_socket_type(ss->client_socket) != UDP_SOCKET) {
+    return false;
+  }
+  if (server->ct == TURN_CREDENTIALS_LONG_TERM) {
+    return false;
+  }
+  if (is_allocation_valid(&(ss->alloc))) {
+    return false;
+  }
+  if (ss->mobile_resume_target != 0) {
+    return false;
+  }
+  return true;
+}
+
+void turn_session_refresh_to_be_allocated_timeout(ts_ur_super_session *ss) {
+  if (!ss || !ss->server || ss->to_be_closed) {
+    return;
+  }
+  if (is_allocation_valid(&(ss->alloc))) {
+    return;
+  }
+
+  turn_turnserver *server = (turn_turnserver *)ss->server;
+  int at = TURN_MAX_ALLOCATE_TIMEOUT;
+  if (*(server->stun_only)) {
+    at = TURN_MAX_ALLOCATE_TIMEOUT_STUN_ONLY;
+  }
+
+  IOA_EVENT_DEL(ss->to_be_allocated_timeout_ev);
+  ss->to_be_allocated_timeout_ev = set_ioa_timer(server->e, at, 0, client_to_be_allocated_timeout_handler, ss, 1,
+                                                 "client_to_be_allocated_timeout_handler");
+}
+
 int open_client_connection_session(turn_turnserver *server, struct socket_message *sm) {
   int ret = 0;
   FUNCSTART;
@@ -4732,6 +5454,8 @@ int open_client_connection_session(turn_turnserver *server, struct socket_messag
   int at = TURN_MAX_ALLOCATE_TIMEOUT;
   if (*(server->stun_only)) {
     at = TURN_MAX_ALLOCATE_TIMEOUT_STUN_ONLY;
+  } else if (ss->client_socket->dtls_half_open) {
+    at = TURN_DTLS_HALF_OPEN_TIMEOUT;
   }
 
   IOA_EVENT_DEL(ss->to_be_allocated_timeout_ev);
@@ -4742,6 +5466,20 @@ int open_client_connection_session(turn_turnserver *server, struct socket_messag
     client_input_handler(ss->client_socket, IOA_EV_READ, &(sm->nd), ss, sm->can_resume);
     ioa_network_buffer_delete(server->e, sm->nd.nbh);
     sm->nd.nbh = NULL;
+
+    if ((ret == 0) && turn_should_reap_unallocated_noauth_udp(server, ss)) {
+      ss->to_be_closed = true;
+    }
+
+    /* The initial packet may have scheduled this brand-new session for
+     * teardown (e.g. a stateless-nonce auth challenge, issue #1999). Nothing
+     * later on this code path would reap it, so do it here; otherwise the
+     * session would linger until the to-be-allocated timeout. */
+    if ((ret == 0) && (ss->to_be_closed || ioa_socket_tobeclosed(ss->client_socket))) {
+      shutdown_client_connection(server, ss, 0, "initial packet processing");
+      FUNCEND;
+      return 0;
+    }
   }
 
   FUNCEND;
@@ -4750,6 +5488,10 @@ int open_client_connection_session(turn_turnserver *server, struct socket_messag
 }
 
 /////////////// io handlers ///////////////////
+
+void turn_peer_input_handler(ioa_socket_handle s, int event_type, ioa_net_data *data, void *arg, int can_resume) {
+  peer_input_handler(s, event_type, data, arg, can_resume);
+}
 
 static void peer_input_handler(ioa_socket_handle s, int event_type, ioa_net_data *in_buffer, void *arg,
                                int can_resume) {
@@ -4893,8 +5635,8 @@ static void client_input_handler(ioa_socket_handle s, int event_type, ioa_net_da
 
   if (ss->to_be_closed) {
     if (server->verbose) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: client socket to be closed in client handler: ss=%p\n",
-                    (unsigned long long)(ss->id), ss);
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "client socket to be closed in client handler: ss=%p (session %018llu)\n", ss,
+                    (unsigned long long)(ss->id));
     }
     set_ioa_socket_tobeclosed(s);
   }
@@ -4909,14 +5651,18 @@ void init_turn_server(turn_turnserver *server, turnserver_id id, int verbose, io
                       bool *no_udp_relay, vintp stale_nonce, vintp max_allocate_lifetime, vintp channel_lifetime,
                       vintp permission_lifetime, bool *stun_only, bool *no_stun, bool software_attribute,
                       bool *web_admin_listen_on_workers, turn_server_addrs_list_t *alternate_servers_list,
-                      turn_server_addrs_list_t *tls_alternate_servers_list, turn_server_addrs_list_t *aux_servers_list,
+                      turn_server_addrs_list_t *tls_alternate_servers_list,
+                      turn_server_addrs_list_t *tcp_alternate_servers_list,
+                      turn_server_addrs_list_t *udp_alternate_servers_list, turn_server_addrs_list_t *aux_servers_list,
                       int self_udp_balance, bool *no_multicast_peers, bool *allow_loopback_peers,
                       ip_range_list_t *ip_whitelist, ip_range_list_t *ip_blacklist,
                       send_socket_to_relay_cb send_socket_to_relay, bool *secure_stun, bool *mobility, int server_relay,
                       send_turn_session_info_cb send_turn_session_info, send_https_socket_cb send_https_socket,
                       int sock_buf_size, allocate_bps_cb allocate_bps_func, int oauth, const char *oauth_server_name,
                       const char *acme_redirect, ALLOCATION_DEFAULT_ADDRESS_FAMILY allocation_default_address_family,
-                      bool *log_binding, bool *stun_backward_compatibility, bool *respond_http_unsupported) {
+                      bool *log_binding, bool *stun_backward_compatibility, bool *rfc5766_channel_numbers,
+                      bool *rfc3489_compatibility, bool *respond_http_unsupported, bool include_reason_string,
+                      turn_ratelimit_mode *ratelimit_unauthorized_mode, vintp ratelimit_unauthorized_requests_per_sec) {
 
   if (!server) {
     return;
@@ -4951,14 +5697,14 @@ void init_turn_server(turn_turnserver *server, turnserver_id id, int verbose, io
   }
   server->acme_redirect = acme_redirect;
 
-  TURN_LOG_FUNC(TURN_LOG_LEVEL_DEBUG, "turn server id=%d created\n", (int)id);
-
   server->check_origin = check_origin;
   server->no_tcp_relay = no_tcp_relay;
   server->no_udp_relay = no_udp_relay;
 
   server->alternate_servers_list = alternate_servers_list;
   server->tls_alternate_servers_list = tls_alternate_servers_list;
+  server->tcp_alternate_servers_list = tcp_alternate_servers_list;
+  server->udp_alternate_servers_list = udp_alternate_servers_list;
   server->aux_servers_list = aux_servers_list;
   server->self_udp_balance = self_udp_balance;
 
@@ -4995,9 +5741,18 @@ void init_turn_server(turn_turnserver *server, turnserver_id id, int verbose, io
 
   server->stun_backward_compatibility = stun_backward_compatibility;
 
+  server->rfc5766_channel_numbers = rfc5766_channel_numbers;
+
+  server->rfc3489_compatibility = rfc3489_compatibility;
+
   server->respond_http_unsupported = respond_http_unsupported;
 
+  server->include_reason_string = include_reason_string;
+
   server->is_draining = false;
+
+  server->ratelimit_unauthorized_mode = ratelimit_unauthorized_mode;
+  server->ratelimit_unauthorized_requests_per_sec = ratelimit_unauthorized_requests_per_sec;
 }
 
 ioa_engine_handle turn_server_get_engine(turn_turnserver *s) {
@@ -5009,6 +5764,104 @@ ioa_engine_handle turn_server_get_engine(turn_turnserver *s) {
 
 void set_disconnect_cb(turn_turnserver *server, int (*disconnect)(ts_ur_super_session *)) {
   server->disconnect = disconnect;
+}
+
+void set_unauthenticated_401_metric_cbs(turn_turnserver *server, unauthenticated_401_metric_cb request_cb,
+                                        unauthenticated_401_metric_cb response_cb,
+                                        unauthenticated_401_metric_cb dropped_response_cb) {
+  if (server) {
+    server->unauthenticated_401_request_cb = request_cb;
+    server->unauthenticated_401_response_cb = response_cb;
+    server->unauthenticated_401_dropped_response_cb = dropped_response_cb;
+  }
+}
+
+void set_unauthenticated_reply_metric_cb(turn_turnserver *server, unauthenticated_reply_metric_cb cb) {
+  if (server) {
+    server->unauthenticated_reply_cb = cb;
+  }
+}
+
+bool turn_server_unauthenticated_reply_suppressed(turn_turnserver *server, const ioa_addr *src, int err_code) {
+  const turn_ratelimit_mode mode =
+      server->ratelimit_unauthorized_mode ? *(server->ratelimit_unauthorized_mode) : TURN_RATELIMIT_OFF;
+  turn_ratelimit_verdict verdict = TURN_RATELIMIT_SENT;
+
+  if (mode != TURN_RATELIMIT_OFF && src) {
+    const uint32_t limit = (uint32_t) * (server->ratelimit_unauthorized_requests_per_sec);
+    bool first_drop = false;
+    bool first_collision = false;
+    if (ratelimit_consume_address(src, limit, &first_drop, &first_collision)) {
+      verdict = (mode == TURN_RATELIMIT_ENFORCE) ? TURN_RATELIMIT_SUPPRESSED : TURN_RATELIMIT_WOULD_SUPPRESS;
+    }
+
+    if (first_drop || first_collision) {
+      char raddr[INET6_ADDRSTRLEN + 1] = {0};
+      addr_to_string_no_port(src, raddr);
+      if (first_collision) {
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
+                      "401 rate-limit bucket collision from %s, sharing active bucket budget for this window\n", raddr);
+      }
+      if (first_drop && verdict == TURN_RATELIMIT_WOULD_SUPPRESS) {
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
+                      "unauthorized-response rate-limit would suppress from %s (error %d, limit %u/s), observe mode: "
+                      "responses still sent for this window\n",
+                      raddr, err_code, limit);
+      } else if (first_drop && err_code == 401) {
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "401 rate-limit exceeded from %s, suppressing responses for this window\n",
+                      raddr);
+      } else if (first_drop) {
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
+                      "unauthorized-response rate-limit exceeded from %s (error %d), suppressing responses for this "
+                      "window\n",
+                      raddr, err_code);
+      }
+    }
+  }
+
+  if (verdict == TURN_RATELIMIT_SUPPRESSED && err_code == 401 && server->unauthenticated_401_dropped_response_cb) {
+    server->unauthenticated_401_dropped_response_cb();
+  }
+  if (server->unauthenticated_reply_cb) {
+    server->unauthenticated_reply_cb(err_code, verdict);
+  }
+  return verdict == TURN_RATELIMIT_SUPPRESSED;
+}
+
+void set_auth_credential_failure_metric_cb(turn_turnserver *server, auth_credential_failure_metric_cb cb) {
+  if (server) {
+    server->auth_credential_failure_cb = cb;
+  }
+}
+
+void set_stateless_nonce(turn_turnserver *server, bool *enabled, const uint8_t *key, size_t key_size) {
+  if (server) {
+    server->stateless_nonce = enabled;
+    server->stateless_nonce_key = key;
+    server->stateless_nonce_key_size = key_size;
+  }
+}
+
+void turn_server_set_oauth_legacy_mac_key(turn_turnserver *server, bool *enabled) {
+  if (server) {
+    server->oauth_legacy_mac_key = enabled;
+  }
+}
+
+bool turn_server_stateless_nonce_enabled(const turn_turnserver *server) {
+  return server && server->stateless_nonce && *(server->stateless_nonce) && server->stateless_nonce_key &&
+         server->stateless_nonce_key_size;
+}
+
+/* Maximum age of a presented stateless nonce. --stale-nonce=0 means "nonce
+ * never goes stale" for an established session, but validating a nonce on a
+ * fresh session still needs a finite bound, so fall back to the protocol
+ * default. */
+turn_time_t turn_server_stateless_nonce_lifetime(const turn_turnserver *server) {
+  if (server && server->stale_nonce && (*(server->stale_nonce) > 0)) {
+    return (turn_time_t)(*(server->stale_nonce));
+  }
+  return (turn_time_t)STUN_DEFAULT_NONCE_EXPIRATION_TIME;
 }
 
 //////////////////////////////////////////////////////////////////

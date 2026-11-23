@@ -15,8 +15,8 @@ Coturn TURN server Docker image
 
 ## Supported tags and respective `Dockerfile` links
 
-- [`4.8.0-r1`, `4.8.0-r0-debian`, `4.8.0`, `4.8.0-debian`, `4.8.0-trixie`, `4.8`, `4.8-debian`, `4.8-trixie`, `4`, `4-debian`, `4-trixie`, `debian`, `trixie`, `latest`][d1]
-- [`4.8.0-r1-alpine`, `4.8.0-alpine`, `4.8.0-alpine3.23`, `4.8-alpine`, `4.8-alpine3.23`, `4-alpine`, `4-alpine3.23`, `alpine`, `alpine3.23`][d2]
+- [`4.19.1-r0`, `4.19.1-r0-debian`, `4.19.1`, `4.19.1-debian`, `4.19.1-trixie`, `4.19`, `4.19-debian`, `4.19-trixie`, `4`, `4-debian`, `4-trixie`, `debian`, `trixie`, `latest`][d1]
+- [`4.19.1-r0-alpine`, `4.19.1-alpine`, `4.19.1-alpine3.24`, `4.19-alpine`, `4.19-alpine3.24`, `4-alpine`, `4-alpine3.24`, `alpine`, `alpine3.24`][d2]
 
 
 
@@ -80,8 +80,7 @@ By default, default Coturn configuration and CLI options provided in the `CMD` [
                -n --log-file=stdout \
                --min-port=49160 --max-port=49200 \
                --lt-cred-mech --fingerprint \
-               --no-multicast-peers --no-cli \
-               --no-tlsv1 --no-tlsv1_1 \
+               --no-multicast-peers \
                --realm=my.realm.org \  
     ```
     

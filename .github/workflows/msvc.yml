@@ -38,7 +38,7 @@ jobs:
     permissions:
       security-events: write  # required for all CodeQL to report detected outcomes
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Create directories
         run: |
@@ -76,7 +76,7 @@ jobs:
 
       # Upload SARIF file to GitHub Code Scanning Alerts
       - name: Upload SARIF to GitHub
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.39.3
         with:
           sarif_file: ${{ steps.run-analysis.outputs.sarif }}
 
@@ -85,7 +85,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        BUILD_TYPE: ["Release", "Debug"]
+        BUILD_TYPE: ["Release"]
         BUILD_SHARED_LIBS: ["OFF", "ON"]
         CMAKE_GENERATOR_PLATFORM: ["x64", "Win32"]
         os: ["windows"]
@@ -112,10 +112,10 @@ jobs:
       run:
         shell: cmd
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install NSIS for packaging
-        uses: repolevedavaj/install-nsis@v1.1.0
+        uses: repolevedavaj/install-nsis@v1.3.0
         with:
           nsis-version: "3.11"
         if: ${{ matrix.BUILD_TYPE == 'Release' }}
@@ -157,7 +157,7 @@ jobs:
         if: ${{ matrix.BUILD_TYPE == 'Release' }}
 
       - name: Update artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: coturn_msvc-${{ matrix.VCPKG_PLATFORM_TOOLSET }}-${{ matrix.CMAKE_GENERATOR_PLATFORM }}-${{ matrix.BUILD_SHARED_LIBS }}
           path: |

@@ -60,10 +60,16 @@
 
 #if defined(_MSC_VER)
 #include <direct.h>
+#include <io.h>
+#ifndef R_OK
+#define R_OK 4 /* MSVC has no R_OK; 4 is the _access() read-permission mode */
+#endif
+#define access _access /* the POSIX name is deprecated in the MSVC CRT (C4996) */
 #else
 #include <unistd.h>
 #endif
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,7 +96,7 @@ int socket_set_nonblocking(evutil_socket_t fd) {
   ioctlsocket(fd, FIONBIO, (unsigned long *)&nonblocking);
 #else
   if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
-    perror("O_NONBLOCK");
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "O_NONBLOCK: %s\n", strerror(errno));
     return -1;
   }
 #endif
@@ -122,8 +128,8 @@ int set_sock_buf_size(evutil_socket_t fd, int sz0) {
   }
 
   if (sz < 1) {
-    perror("Cannot set socket rcv size");
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Cannot set rcv sock size %d on fd %d\n", sz0, fd);
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot set receive sock size %d on fd %d. Error: %s\n", sz0, fd,
+                  strerror(errno));
   }
 
   sz = sz0;
@@ -136,8 +142,8 @@ int set_sock_buf_size(evutil_socket_t fd, int sz0) {
   }
 
   if (sz < 1) {
-    perror("Cannot set socket snd size");
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Cannot set snd sock size %d on fd %d\n", sz0, fd);
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot set send socket size %d on fd %d. Error: %s\n", sz0, fd,
+                  strerror(errno));
   }
 
   return 0;
@@ -206,7 +212,7 @@ int socket_set_reusable(evutil_socket_t fd, int flag, SOCKET_TYPE st) {
       int on = flag;
       const int ret = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const void *)&on, (socklen_t)sizeof(on));
       if (ret < 0) {
-        perror("SO_REUSEADDR");
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "SO_REUSEADDR: %s\n", strerror(errno));
       }
     }
 #endif
@@ -218,7 +224,7 @@ int socket_set_reusable(evutil_socket_t fd, int flag, SOCKET_TYPE st) {
         int on = flag;
         int ret = setsockopt(fd, IPPROTO_SCTP, SCTP_REUSE_PORT, (const void *)&on, (socklen_t)sizeof(on));
         if (ret < 0) {
-          perror("SCTP_REUSE_PORT");
+          TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "SCTP_REUSE_PORT: %s\n", strerror(errno));
         }
       }
     }
@@ -245,13 +251,14 @@ int sock_bind_to_device(evutil_socket_t fd, const unsigned char *ifname) {
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
 
-    strncpy(ifr.ifr_name, (const char *)ifname, sizeof(ifr.ifr_name));
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", (const char *)ifname);
 
     if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, (const void *)&ifr, sizeof(ifr)) < 0) {
       if (socket_eperm()) {
-        perror("You must obtain superuser privileges to bind a socket to device");
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "You must obtain superuser privileges to bind a socket to device: %s\n",
+                      strerror(errno));
       } else {
-        perror("Cannot bind socket to device");
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot bind socket to device: %s\n", strerror(errno));
       }
 
       return -1;
@@ -285,7 +292,7 @@ int addr_connect(evutil_socket_t fd, const ioa_addr *addr, int *out_errno) {
     }
 
     if (err < 0 && !socket_einprogress()) {
-      perror("Connect");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Connect: %s\n", strerror(errno));
     }
 
     return err;
@@ -318,11 +325,9 @@ int addr_bind(evutil_socket_t fd, const ioa_addr *addr, int reusable, int debug,
     }
     if (ret < 0) {
       if (debug) {
-        const int err = socket_errno();
-        perror("bind");
-        char str[129];
-        addr_to_string(addr, (uint8_t *)str);
-        TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "Trying to bind fd %d to <%s>: errno=%d\n", fd, str, err);
+        char str[MAX_IOA_ADDR_STRING];
+        addr_to_string(addr, str);
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "Trying to bind fd %d to <%s>: errno=%d\n", fd, str, socket_errno());
       }
     }
     return ret;
@@ -364,7 +369,7 @@ int get_raw_socket_ttl(evutil_socket_t fd, int family) {
 #else
     socklen_t slen = (socklen_t)sizeof(ttl);
     if (getsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, (void *)&ttl, &slen) < 0) {
-      perror("get HOPLIMIT on socket");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "get HOPLIMIT on socket: %s\n", strerror(errno));
       return TTL_IGNORE;
     }
 #endif
@@ -377,7 +382,7 @@ int get_raw_socket_ttl(evutil_socket_t fd, int family) {
 #else
     socklen_t slen = (socklen_t)sizeof(ttl);
     if (getsockopt(fd, IPPROTO_IP, IP_TTL, (void *)&ttl, &slen) < 0) {
-      perror("get TTL on socket");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "get TTL on socket: %s\n", strerror(errno));
       return TTL_IGNORE;
     }
 #endif
@@ -400,7 +405,7 @@ int get_raw_socket_tos(evutil_socket_t fd, int family) {
 #else
     socklen_t slen = (socklen_t)sizeof(tos);
     if (getsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, (void *)&tos, &slen) < 0) {
-      perror("get TCLASS on socket");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "get TCLASS on socket: %s\n", strerror(errno));
       return -1;
     }
 #endif
@@ -413,7 +418,7 @@ int get_raw_socket_tos(evutil_socket_t fd, int family) {
 #else
     socklen_t slen = (socklen_t)sizeof(tos);
     if (getsockopt(fd, IPPROTO_IP, IP_TOS, (void *)&tos, &slen) < 0) {
-      perror("get TOS on socket");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "get TOS on socket: %s\n", strerror(errno));
       return -1;
     }
 #endif
@@ -433,7 +438,7 @@ int set_raw_socket_ttl(evutil_socket_t fd, int family, int ttl) {
 #else
     CORRECT_RAW_TTL(ttl);
     if (setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, (const void *)&ttl, sizeof(ttl)) < 0) {
-      perror("set HOPLIMIT on socket");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "set HOPLIMIT on socket: %s\n", strerror(errno));
       return -1;
     }
 #endif
@@ -444,7 +449,7 @@ int set_raw_socket_ttl(evutil_socket_t fd, int family, int ttl) {
 #else
     CORRECT_RAW_TTL(ttl);
     if (setsockopt(fd, IPPROTO_IP, IP_TTL, (const void *)&ttl, sizeof(ttl)) < 0) {
-      perror("set TTL on socket");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "set TTL on socket: %s\n", strerror(errno));
       return -1;
     }
 #endif
@@ -462,7 +467,7 @@ int set_raw_socket_tos(evutil_socket_t fd, int family, int tos) {
 #else
     CORRECT_RAW_TOS(tos);
     if (setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, (const void *)&tos, sizeof(tos)) < 0) {
-      perror("set TCLASS on socket");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "set TCLASS on socket: %s\n", strerror(errno));
       return -1;
     }
 #endif
@@ -472,7 +477,7 @@ int set_raw_socket_tos(evutil_socket_t fd, int family, int tos) {
     UNUSED_ARG(tos);
 #else
     if (setsockopt(fd, IPPROTO_IP, IP_TOS, (const void *)&tos, sizeof(tos)) < 0) {
-      perror("set TOS on socket");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "set TOS on socket: %s\n", strerror(errno));
       return -1;
     }
 #endif
@@ -562,9 +567,8 @@ int set_socket_df(evutil_socket_t fd, int family, int value) {
     }
     if (ret < 0) {
       int err = socket_errno();
-      perror("set socket df:");
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s: set sockopt failed: fd=%d, err=%d, family=%d\n", __FUNCTION__, fd, err,
-                    family);
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: set sockopt failed: fd=%d, err=%d, family=%d. Error: %s\n", __FUNCTION__,
+                    fd, err, family, strerror(errno));
     }
   }
 #elif defined(IPPROTO_IP) && defined(IP_MTU_DISCOVER) && defined(IP_PMTUDISC_DO) && defined(IP_PMTUDISC_DONT) // LINUX
@@ -588,8 +592,7 @@ int set_socket_df(evutil_socket_t fd, int family, int value) {
 #endif
     }
     if (ret < 0) {
-      perror("set DF");
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s: set sockopt failed\n", __FUNCTION__);
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: set sockopt failed. Error: %s\n", __FUNCTION__, strerror(errno));
     }
   }
 #else
@@ -918,7 +921,7 @@ static char *_WTA(__in wchar_t *pszInBuf, __in int nInSize, __out char **pszOutB
   // if MultiByteToWideChar is provided a length for the input, it does not add space for a nul-terminator
   // and we have to add space to the allocation ourselves.
   (*pnOutSize)++;
-  *pszOutBuf = malloc(*pnOutSize * sizeof(char));
+  *pszOutBuf = turn_malloc(*pnOutSize * sizeof(char));
   if (!pszOutBuf) {
     return NULL;
   }
@@ -954,8 +957,7 @@ int getdomainname(char *name, size_t len) {
         if (nOutSize > len - 1) {
           n = len - 1;
         }
-        strncpy(name, pszOut, n);
-        name[n] = 0;
+        snprintf(name, n + 1, "%s", pszOut);
         TURN_LOG_FUNC(TURN_LOG_LEVEL_DEBUG, "DomainForestName: %s\n", pszOut);
       } else {
         TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "wchar convert to char fail");
@@ -975,8 +977,7 @@ int getdomainname(char *name, size_t len) {
         if (nOutSize > len - 1) {
           n = len - 1;
         }
-        strncpy(name, pszOut, n);
-        name[n] = 0;
+        snprintf(name, n + 1, "%s", pszOut);
         TURN_LOG_FUNC(TURN_LOG_LEVEL_DEBUG, "DomainNameDns: %s\n", pszOut);
       } else {
         TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "wchar convert to char fail");
@@ -996,8 +997,7 @@ int getdomainname(char *name, size_t len) {
         if (nOutSize > len - 1) {
           n = len - 1;
         }
-        strncpy(name, pszOut, n);
-        name[n] = 0;
+        snprintf(name, n + 1, "%s", pszOut);
         TURN_LOG_FUNC(TURN_LOG_LEVEL_DEBUG, "DomainNameFlat: %s\n", pszOut);
       } else {
         TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "wchar convert to char fail");
@@ -1065,7 +1065,7 @@ void set_execdir(void) {
   _var = getenv("_");
 #endif
   if (_var && *_var) {
-    _var = strdup(_var);
+    _var = turn_strdup(_var);
     char *edir = _var;
     if (edir[0] != '.') {
       edir = strstr(edir, "/");
@@ -1078,7 +1078,7 @@ void set_execdir(void) {
     if (c_execdir) {
       free(c_execdir);
     }
-    c_execdir = strdup(edir);
+    c_execdir = turn_strdup(edir);
     free(_var);
   }
 }
@@ -1103,8 +1103,7 @@ void print_abs_file_name(const char *msg1, const char *msg2, const char *fn) {
         }
         const size_t blen = strlen(absfn);
         if (blen < sizeof(absfn) - 1) {
-          strncpy(absfn + blen, "/", sizeof(absfn) - blen);
-          strncpy(absfn + blen + 1, fn, sizeof(absfn) - blen - 1);
+          snprintf(absfn + blen, sizeof(absfn) - blen, "/%s", fn);
         } else {
           STRCPY(absfn, fn);
         }
@@ -1113,7 +1112,11 @@ void print_abs_file_name(const char *msg1, const char *msg2, const char *fn) {
     }
   }
   if (absfn[0]) {
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s%s file found: %s\n", msg1, msg2, absfn);
+    if (access(absfn, R_OK) == 0) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s%s file found: %s\n", msg1, msg2, absfn);
+    } else {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "%s%s file not found or not readable: %s\n", msg1, msg2, absfn);
+    }
   }
 }
 
@@ -1125,7 +1128,7 @@ char *find_config_file(const char *config_file) {
       FILE *f = fopen(config_file, "r");
       if (f) {
         fclose(f);
-        full_path_to_config_file = strdup(config_file);
+        full_path_to_config_file = turn_strdup(config_file);
       }
     } else {
       int i = 0;
@@ -1134,10 +1137,8 @@ char *find_config_file(const char *config_file) {
       while (config_file_search_dirs[i]) {
         const size_t dirlen = strlen(config_file_search_dirs[i]);
         size_t fnsz = sizeof(char) * (dirlen + cflen + 10);
-        char *fn = (char *)malloc(fnsz + 1);
-        strncpy(fn, config_file_search_dirs[i], fnsz);
-        strncpy(fn + dirlen, config_file, fnsz - dirlen);
-        fn[fnsz] = 0;
+        char *fn = (char *)turn_malloc(fnsz + 1);
+        snprintf(fn, fnsz + 1, "%s%s", config_file_search_dirs[i], config_file);
         FILE *f = fopen(fn, "r");
         if (f) {
           fclose(f);
@@ -1148,21 +1149,8 @@ char *find_config_file(const char *config_file) {
         if (config_file_search_dirs[i][0] != '/' && config_file_search_dirs[i][0] != '.' && c_execdir && c_execdir[0]) {
           const size_t celen = strlen(c_execdir);
           fnsz = sizeof(char) * (dirlen + cflen + celen + 10);
-          fn = (char *)malloc(fnsz + 1);
-          strncpy(fn, c_execdir, fnsz);
-          size_t fnlen = strlen(fn);
-          if (fnlen < fnsz) {
-            strncpy(fn + fnlen, "/", fnsz - fnlen);
-            fnlen = strlen(fn);
-            if (fnlen < fnsz) {
-              strncpy(fn + fnlen, config_file_search_dirs[i], fnsz - fnlen);
-              fnlen = strlen(fn);
-              if (fnlen < fnsz) {
-                strncpy(fn + fnlen, config_file, fnsz - fnlen);
-              }
-            }
-          }
-          fn[fnsz] = 0;
+          fn = (char *)turn_malloc(fnsz + 1);
+          snprintf(fn, fnsz + 1, "%s/%s%s", c_execdir, config_file_search_dirs[i], config_file);
           if (strstr(fn, "//") != fn) {
             f = fopen(fn, "r");
             if (f) {
@@ -1193,22 +1181,31 @@ void ignore_sigpipe(void) {
 #if defined(__linux__) || defined(__APPLE__)
   /* Ignore SIGPIPE from TCP sockets */
   if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
-    perror("Cannot set SIGPIPE handler");
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot set SIGPIPE handler: %s\n", strerror(errno));
   }
 #endif
 }
 
 static uint64_t turn_getRandTime(void) {
+#if defined(_MSC_VER)
+  /* MSVC build uses the in-tree shim clock_gettime(int, struct timeval *) -
+   * sub-second field is microseconds, not nanoseconds. */
+  struct timeval tp = {0, 0};
+#if defined(CLOCK_REALTIME)
+  clock_gettime(CLOCK_REALTIME, &tp);
+#else
+  tp.tv_sec = (long)time(NULL);
+#endif
+  return (uint64_t)tp.tv_sec + (uint64_t)tp.tv_usec;
+#else
   struct timespec tp = {0, 0};
 #if defined(CLOCK_REALTIME)
   clock_gettime(CLOCK_REALTIME, &tp);
 #else
   tp.tv_sec = time(NULL);
 #endif
-  const uint64_t current_time = (uint64_t)(tp.tv_sec);
-  const uint64_t current_mstime = (uint64_t)(current_time + (tp.tv_nsec));
-
-  return current_mstime;
+  return (uint64_t)tp.tv_sec + (uint64_t)tp.tv_nsec;
+#endif
 }
 
 void turn_srandom(void) {
@@ -1239,7 +1236,7 @@ unsigned long set_system_parameters(int max_resources) {
 
     struct rlimit rlim;
     if (getrlimit(RLIMIT_NOFILE, &rlim) < 0) {
-      perror("Cannot get system limit");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot get system limit: %s\n", strerror(errno));
     } else {
       rlim.rlim_cur = rlim.rlim_max;
       while ((setrlimit(RLIMIT_NOFILE, &rlim) < 0) && (rlim.rlim_cur > 0)) {
@@ -1303,10 +1300,7 @@ char *base64_encode(const unsigned char *data, size_t input_length, size_t *outp
 
   *output_length = 4 * ((input_length + 2) / 3);
 
-  char *encoded_data = (char *)malloc(*output_length + 1);
-  if (encoded_data == NULL) {
-    return NULL;
-  }
+  char *encoded_data = (char *)turn_malloc(*output_length + 1);
 
   for (size_t i = 0, j = 0; i < input_length;) {
 
@@ -1333,7 +1327,7 @@ char *base64_encode(const unsigned char *data, size_t input_length, size_t *outp
 
 void build_base64_decoding_table(void) {
 
-  char *table = (char *)calloc(256, sizeof(char));
+  char *table = (char *)turn_calloc(256, sizeof(char));
 
   if (table) {
     for (size_t i = 0; i < 64; i++) {
@@ -1353,6 +1347,11 @@ unsigned char *base64_decode(const char *data, size_t input_length, size_t *outp
     return NULL;
   }
 
+  if (input_length == 0) {
+    *output_length = 0;
+    return NULL;
+  }
+
   *output_length = input_length / 4 * 3;
   if (data[input_length - 1] == '=') {
     (*output_length)--;
@@ -1361,19 +1360,16 @@ unsigned char *base64_decode(const char *data, size_t input_length, size_t *outp
     (*output_length)--;
   }
 
-  unsigned char *decoded_data = (unsigned char *)malloc(*output_length);
-  if (decoded_data == NULL) {
-    return NULL;
-  }
+  unsigned char *decoded_data = (unsigned char *)turn_malloc(*output_length);
 
   int i;
   size_t j;
   for (i = 0, j = 0; i < (int)input_length;) {
 
-    const uint32_t sextet_a = data[i] == '=' ? 0 & i++ : decoding_table[(int)data[i++]];
-    const uint32_t sextet_b = data[i] == '=' ? 0 & i++ : decoding_table[(int)data[i++]];
-    const uint32_t sextet_c = data[i] == '=' ? 0 & i++ : decoding_table[(int)data[i++]];
-    const uint32_t sextet_d = data[i] == '=' ? 0 & i++ : decoding_table[(int)data[i++]];
+    const uint32_t sextet_a = data[i] == '=' ? 0 & i++ : decoding_table[(unsigned char)data[i++]];
+    const uint32_t sextet_b = data[i] == '=' ? 0 & i++ : decoding_table[(unsigned char)data[i++]];
+    const uint32_t sextet_c = data[i] == '=' ? 0 & i++ : decoding_table[(unsigned char)data[i++]];
+    const uint32_t sextet_d = data[i] == '=' ? 0 & i++ : decoding_table[(unsigned char)data[i++]];
 
     const uint32_t triple = (sextet_a << 3 * 6) + (sextet_b << 2 * 6) + (sextet_c << 1 * 6) + (sextet_d << 0 * 6);
 
@@ -1416,6 +1412,27 @@ struct event_base *turn_event_base_new(void) {
 
 /////////// OAUTH /////////////////
 
+static bool valid_oauth_key_base64(const char *data, size_t len) {
+  if (!len || (len % 4)) {
+    return false;
+  }
+
+  size_t padding = 0;
+  if (data[len - 1] == '=') {
+    padding++;
+  }
+  if (data[len - 2] == '=') {
+    padding++;
+  }
+  for (size_t i = 0; i < len - padding; ++i) {
+    const unsigned char c = (unsigned char)data[i];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/')) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void convert_oauth_key_data_raw(const oauth_key_data_raw *raw, oauth_key_data *oakd) {
   if (raw && oakd) {
 
@@ -1427,14 +1444,16 @@ void convert_oauth_key_data_raw(const oauth_key_data_raw *raw, oauth_key_data *o
     memcpy(oakd->as_rs_alg, raw->as_rs_alg, sizeof(oakd->as_rs_alg));
     memcpy(oakd->kid, raw->kid, sizeof(oakd->kid));
 
-    if (raw->ikm_key[0]) {
+    const char *end = memchr(raw->ikm_key, 0, sizeof(raw->ikm_key));
+    const size_t encoded_size = end ? (size_t)(end - raw->ikm_key) : 0;
+    if (end && valid_oauth_key_base64(raw->ikm_key, encoded_size)) {
       size_t ikm_key_size = 0;
-      char *ikm_key = (char *)base64_decode(raw->ikm_key, strlen(raw->ikm_key), &ikm_key_size);
-      if (ikm_key) {
+      char *ikm_key = (char *)base64_decode(raw->ikm_key, encoded_size, &ikm_key_size);
+      if (ikm_key && ikm_key_size <= sizeof(oakd->ikm_key)) {
         memcpy(oakd->ikm_key, ikm_key, ikm_key_size);
         oakd->ikm_key_size = ikm_key_size;
-        free(ikm_key);
       }
+      free(ikm_key);
     }
   }
 }

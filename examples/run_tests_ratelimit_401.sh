@@ -1,0 +1,211 @@
+#!/bin/bash
+
+# 401 rate-limit feature test.
+#
+# Exercises the --unauthorized-ratelimit / --unauthorized-ratelimit-rps
+# flags end-to-end:
+#
+#   positive: with --unauthorized-ratelimit-rps=1, drive one bounded
+#             turnutils_uclient session. The client retries the 401
+#             challenge several times within the same second, easily
+#             crossing the threshold of 1, so the server must emit
+#             exactly one "401 rate-limit exceeded" log line (the log
+#             is self-rate-limited to one message per (bucket, window)
+#             on purpose).
+#
+#   negative: same harness but --unauthorized-ratelimit-rps=100000. Same
+#             client traffic produces nowhere near 100000 401s/sec, so the
+#             "exceeded" log line must NOT appear.
+#
+# Split out of run_tests.sh so the rate-limit configuration is fully
+# isolated from the protocol-test server fixture in that script — a
+# regression in either suite must not be masked by the other's flags.
+
+# Per-run log path; $$ keeps two concurrent invocations from clobbering
+# each other.
+RATELIMIT_LOG="/tmp/run_tests_ratelimit_401.$$.log"
+turnserver_pid=""
+
+cleanup() {
+    if [ -n "$turnserver_pid" ]; then
+        kill "$turnserver_pid" 2>/dev/null
+        wait "$turnserver_pid" 2>/dev/null
+    fi
+    rm -f "$RATELIMIT_LOG"
+}
+trap cleanup EXIT
+
+# Detect cmake build and adjust path.
+BINDIR="../bin"
+if [ ! -f "$BINDIR/turnserver" ]; then
+    BINDIR="../build/bin"
+fi
+
+# macOS loopback drops UDP relay traffic intermittently and the
+# turnutils_uclient retry pattern there is different enough that the
+# log-line accounting becomes flaky. Linux CI is the canonical target
+# for this feature — skip on Darwin rather than emit false failures.
+if [ "$(uname -s)" = "Darwin" ]; then
+    echo "Skipping 401 rate-limit test on macOS"
+    exit 0
+fi
+
+# Block until turnserver has printed the line that follows relay-port
+# init and per-thread UDP listener setup. Cheaper and more reliable
+# than `sleep N`; mirrors the pattern in run_tests.sh.
+wait_for_turnserver() {
+    local i
+    for i in $(seq 1 40); do
+        if grep -q "Total auth threads:" "$RATELIMIT_LOG" 2>/dev/null; then
+            return 0
+        fi
+        if ! kill -0 "$turnserver_pid" 2>/dev/null; then
+            echo "FATAL: turnserver (pid $turnserver_pid) exited before init completed"
+            echo "--- turnserver log ---"
+            cat "$RATELIMIT_LOG" 2>/dev/null || echo "(log file missing)"
+            return 1
+        fi
+        sleep 0.5
+    done
+    echo "FATAL: turnserver never reached 'Total auth threads:' init line within 20s"
+    echo "--- turnserver log (last 30 lines) ---"
+    tail -30 "$RATELIMIT_LOG" 2>/dev/null || echo "(log file missing)"
+    return 1
+}
+
+# Start a fresh turnserver with --unauthorized-ratelimit + caller-supplied
+# threshold flag. The previous server (if any) is killed
+# first; the log file is truncated so each case sees a clean slate.
+run_ratelimit_server() {
+    if [ -n "$turnserver_pid" ]; then
+        kill "$turnserver_pid" 2>/dev/null
+        wait "$turnserver_pid" 2>/dev/null
+    fi
+    : > "$RATELIMIT_LOG"
+    "$BINDIR/turnserver" --use-auth-secret --static-auth-secret=secret --realm=north.gov \
+        --allow-loopback-peers --no-tls \
+        --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 \
+        --listening-port=3479 \
+        --log-file=stdout \
+        "$@" > "$RATELIMIT_LOG" 2>&1 &
+    turnserver_pid="$!"
+    wait_for_turnserver
+}
+
+# turnutils_uclient with bad credentials, stopped as soon as the server log
+# shows the expected line (first argument, an extended regex). With no pattern
+# - the case asserting that nothing is logged - the client runs for a fixed
+# window several times longer than the positive cases need. All assertions are
+# against the server log, so the client's exit status does not matter.
+NEGATIVE_WINDOW=6
+drive_bad_client() {
+    local pattern="$1"
+    local limit=15
+    [ -z "$pattern" ] && limit=$NEGATIVE_WINDOW
+    timeout "${limit}s" "$BINDIR/turnutils_uclient" \
+        -e 127.0.0.1 -X -g -u baduser -W wrongsecret -p 3479 127.0.0.1 \
+        > /dev/null 2>&1 &
+    local client_pid="$!"
+    while kill -0 "$client_pid" 2>/dev/null; do
+        if [ -n "$pattern" ] && grep -Eq "$pattern" "$RATELIMIT_LOG"; then
+            break
+        fi
+        sleep 0.2
+    done
+    kill "$client_pid" 2>/dev/null
+    wait "$client_pid" 2>/dev/null
+    sleep 0.5
+}
+
+echo "Running 401 rate-limit (positive)"
+run_ratelimit_server --unauthorized-ratelimit --unauthorized-ratelimit-rps=1 || exit 1
+drive_bad_client '401 rate-limit exceeded from'
+
+if grep -q '401 rate-limit exceeded from' "$RATELIMIT_LOG"; then
+    echo OK
+else
+    echo "FAIL: rate-limit log line not emitted under attack"
+    echo "--- turnserver log (last 40 lines) ---"
+    tail -40 "$RATELIMIT_LOG"
+    exit 1
+fi
+
+echo "Running 401 rate-limit (observe: same threshold, nothing suppressed)"
+run_ratelimit_server --unauthorized-ratelimit=observe --unauthorized-ratelimit-rps=1 || exit 1
+drive_bad_client 'rate-limit would suppress from .*observe mode'
+
+if grep -q 'rate-limit would suppress from .*observe mode' "$RATELIMIT_LOG" \
+   && ! grep -q '401 rate-limit exceeded from' "$RATELIMIT_LOG"; then
+    echo OK
+else
+    echo "FAIL: observe mode did not log a would-suppress line, or suppressed a reply"
+    echo "--- turnserver log (last 40 lines) ---"
+    tail -40 "$RATELIMIT_LOG"
+    exit 1
+fi
+
+echo "Running 401 rate-limit (negative: high threshold)"
+run_ratelimit_server --unauthorized-ratelimit --unauthorized-ratelimit-rps=100000 || exit 1
+drive_bad_client ''
+
+if grep -q '401 rate-limit exceeded from' "$RATELIMIT_LOG"; then
+    echo "FAIL: rate-limit triggered below threshold (--unauthorized-ratelimit-rps=100000)"
+    echo "--- turnserver log (last 40 lines) ---"
+    tail -40 "$RATELIMIT_LOG"
+    exit 1
+else
+    echo OK
+fi
+
+# The stateless-nonce listener answers a forged MESSAGE-INTEGRITY with a 438
+# without building a session. That reply still goes to an unverified source, so
+# it draws on the same per-source budget as the 401.
+FLOOD=50
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "SKIP: python3 not available (forged-MESSAGE-INTEGRITY reflection cap)"
+    exit 0
+fi
+
+echo "Running unauthenticated-reply rate-limit (forged MESSAGE-INTEGRITY, positive)"
+run_ratelimit_server --stateless-nonce-secret=fleet-nonce-secret \
+    --unauthorized-ratelimit --unauthorized-ratelimit-rps=1 || exit 1
+replied="$(python3 scripts/stateless_nonce_forged_mi.py 127.0.0.1 3479 user flood "$FLOOD" \
+           | sed -n 's/.*replied=\([0-9]*\).*/\1/p')"
+if [ -n "$replied" ] && [ "$replied" -lt "$FLOOD" ] \
+   && grep -q 'unauthorized-response rate-limit exceeded from' "$RATELIMIT_LOG"; then
+    echo "OK ($replied/$FLOOD 438s answered, rest suppressed)"
+else
+    echo "FAIL: forged-MI 438s not capped (replied=$replied of $FLOOD)"
+    echo "--- turnserver log (last 40 lines) ---"
+    tail -40 "$RATELIMIT_LOG"
+    exit 1
+fi
+
+echo "Running unauthenticated-reply rate-limit (forged MESSAGE-INTEGRITY, observe)"
+run_ratelimit_server --stateless-nonce-secret=fleet-nonce-secret \
+    --unauthorized-ratelimit=observe --unauthorized-ratelimit-rps=1 || exit 1
+replied="$(python3 scripts/stateless_nonce_forged_mi.py 127.0.0.1 3479 user flood "$FLOOD" \
+           | sed -n 's/.*replied=\([0-9]*\).*/\1/p')"
+if [ "$replied" = "$FLOOD" ] && grep -q 'rate-limit would suppress from .*(error 438' "$RATELIMIT_LOG" \
+   && ! grep -q 'unauthorized-response rate-limit exceeded from' "$RATELIMIT_LOG"; then
+    echo "OK ($replied/$FLOOD 438s answered)"
+else
+    echo "FAIL: observe mode suppressed 438s or did not log (replied=$replied of $FLOOD)"
+    echo "--- turnserver log (last 40 lines) ---"
+    tail -40 "$RATELIMIT_LOG"
+    exit 1
+fi
+
+echo "Running unauthenticated-reply rate-limit (forged MESSAGE-INTEGRITY, negative: high threshold)"
+run_ratelimit_server --stateless-nonce-secret=fleet-nonce-secret \
+    --unauthorized-ratelimit --unauthorized-ratelimit-rps=100000 || exit 1
+replied="$(python3 scripts/stateless_nonce_forged_mi.py 127.0.0.1 3479 user flood "$FLOOD" \
+           | sed -n 's/.*replied=\([0-9]*\).*/\1/p')"
+if [ "$replied" = "$FLOOD" ] && ! grep -q 'unauthorized-response rate-limit exceeded from' "$RATELIMIT_LOG"; then
+    echo OK
+else
+    echo "FAIL: 438s suppressed below threshold (replied=$replied of $FLOOD)"
+    echo "--- turnserver log (last 40 lines) ---"
+    tail -40 "$RATELIMIT_LOG"
+    exit 1
+fi

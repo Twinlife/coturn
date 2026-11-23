@@ -32,13 +32,280 @@
  * SUCH DAMAGE.
  */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "udpserver.h"
 #include "apputils.h"
 #include "stun_buffer.h"
+#include <errno.h>
+#include <string.h>
 
 #include <limits.h> // for USHRT_MAX
 
+#if defined(__linux__)
+#include <netinet/in.h> // for IPPROTO_IP/IPPROTO_IPV6, IP_RECVTOS, IPV6_RECVTCLASS
+#include <netinet/udp.h>
+#include <sys/socket.h>
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+#ifndef SOL_UDP
+#define SOL_UDP 17
+#endif
+#endif
+
 /////////////// io handlers ///////////////////
+
+/* DSCP/TOS reflection: turnutils_peer echoes every datagram back with the same
+ * marking it arrived with, so an end-to-end QoS test can confirm a TURN relay
+ * preserves DSCP on the peer->client leg too (issue #385). This reads the
+ * marking off the ancillary data of each inbound packet, so — like the relay's
+ * own TOS handling — it lives on the Linux recvmmsg path; other platforms echo
+ * without it (the relay likewise drops TOS there, per RFC 5766). */
+#if defined(__linux__)
+
+/* Per-callback batch state. The peer is single-threaded (one libevent
+ * event_base, all sockets dispatched serially), so module-static buffers
+ * are race-free and avoid per-callback allocation. */
+#define PEER_BATCH 32
+/* Max bytes we are willing to echo per datagram. STUN packets are small;
+ * 4 KiB covers anything that fits in a Path-MTU UDP datagram with comfortable
+ * headroom and keeps the static state at PEER_BATCH * 4 KiB = 128 KiB. */
+#define PEER_DGRAM_MAX 4096
+/* Bound the drain loop so a packet flood can't starve the rest of the event
+ * loop. PEER_BATCH * MAX_DRAIN_ROUNDS sets the upper bound on packets handled
+ * per readiness event. */
+#define MAX_DRAIN_ROUNDS 8
+/* UDP-GSO: a single sendmsg can describe many segments of gso_size bytes.
+ * We only enable it when batch entries share source AND size — a deliberately
+ * conservative predicate that matches the synthetic packet-flood pattern
+ * without misbehaving on heterogeneous traffic. */
+#define PEER_GSO_MAX_SEGSZ 1472
+
+static struct mmsghdr g_msgs[PEER_BATCH];
+static struct iovec g_iovs[PEER_BATCH];
+static ioa_addr g_srcs[PEER_BATCH];
+static uint8_t g_bufs[PEER_BATCH][PEER_DGRAM_MAX];
+/* Per-entry recv ancillary buffers (TOS) and the parsed marking per datagram. */
+static char g_cmsgs[PEER_BATCH][CMSG_SPACE(sizeof(int)) * 2];
+static int g_toss[PEER_BATCH];
+
+/* Last (fd, tos) pushed to a socket: a steady single flow keeps the marking
+ * constant, so this short-circuits the repeated setsockopt, exactly like the
+ * relay's own set_socket_tos. Single-threaded peer, so no locking. */
+static evutil_socket_t g_tos_fd = -1;
+static int g_tos_cur = INT_MIN;
+
+/* Ask the kernel to attach the received DSCP/TOS as ancillary data. */
+static void enable_recv_tos(evutil_socket_t fd, int family) {
+  const int on = 1;
+  if (family == AF_INET6) {
+#if defined(IPV6_RECVTCLASS)
+    if (setsockopt(fd, IPPROTO_IPV6, IPV6_RECVTCLASS, (const void *)&on, sizeof(on)) < 0) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "set IPV6_RECVTCLASS on peer socket: %s\n", strerror(errno));
+    }
+#endif
+  } else {
+#if defined(IP_RECVTOS)
+    if (setsockopt(fd, IPPROTO_IP, IP_RECVTOS, (const void *)&on, sizeof(on)) < 0) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "set IP_RECVTOS on peer socket: %s\n", strerror(errno));
+    }
+#endif
+  }
+}
+
+/* Pull the DSCP/TOS marking out of a received message's ancillary data, or -1
+ * if none was present. */
+static int peer_recv_tos(struct msghdr *mh) {
+  for (struct cmsghdr *cm = CMSG_FIRSTHDR(mh); cm != NULL; cm = CMSG_NXTHDR(mh, cm)) {
+#if defined(IP_RECVTOS)
+    if (cm->cmsg_level == IPPROTO_IP && (cm->cmsg_type == IP_TOS || cm->cmsg_type == IP_RECVTOS)) {
+      return *((unsigned char *)CMSG_DATA(cm));
+    }
+#endif
+#if defined(IPV6_RECVTCLASS) || defined(IPV6_TCLASS)
+    if (cm->cmsg_level == IPPROTO_IPV6 && cm->cmsg_type == IPV6_TCLASS) {
+      return *((unsigned char *)CMSG_DATA(cm));
+    }
+#endif
+  }
+  return -1;
+}
+
+/* Set the socket's egress marking so the echo carries it. No-op when the value
+ * is already current or was not captured (< 0). */
+static void peer_reflect_tos(evutil_socket_t fd, int family, int tos) {
+  if (tos < 0) {
+    return;
+  }
+  if (fd == g_tos_fd && tos == g_tos_cur) {
+    return;
+  }
+  set_raw_socket_tos(fd, family, tos);
+  g_tos_fd = fd;
+  g_tos_cur = tos;
+}
+
+static int try_gso_echo(evutil_socket_t fd, int n) {
+  if (n < 2) {
+    return 0;
+  }
+
+  const uint32_t s0 = (uint32_t)g_msgs[0].msg_len;
+  if (s0 == 0 || s0 > PEER_GSO_MAX_SEGSZ) {
+    return 0;
+  }
+
+  const socklen_t namelen0 = g_msgs[0].msg_hdr.msg_namelen;
+  for (int i = 1; i < n; ++i) {
+    if (g_msgs[i].msg_len != s0) {
+      return 0;
+    }
+    if (g_msgs[i].msg_hdr.msg_namelen != namelen0) {
+      return 0;
+    }
+    if (memcmp(&g_srcs[i], &g_srcs[0], namelen0) != 0) {
+      return 0;
+    }
+  }
+
+  struct iovec sendiov[PEER_BATCH];
+  for (int i = 0; i < n; ++i) {
+    sendiov[i].iov_base = g_bufs[i];
+    sendiov[i].iov_len = (size_t)s0;
+  }
+
+  union {
+    struct cmsghdr align;
+    char buf[CMSG_SPACE(sizeof(uint16_t))];
+  } cmsg_buf = {0};
+
+  struct msghdr mh = {0};
+  mh.msg_iov = sendiov;
+  mh.msg_iovlen = (size_t)n;
+  mh.msg_name = &g_srcs[0];
+  mh.msg_namelen = namelen0;
+  mh.msg_control = cmsg_buf.buf;
+  mh.msg_controllen = sizeof(cmsg_buf.buf);
+
+  struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+  cm->cmsg_level = SOL_UDP;
+  cm->cmsg_type = UDP_SEGMENT;
+  cm->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+  uint16_t seg = (uint16_t)s0;
+  memcpy(CMSG_DATA(cm), &seg, sizeof(seg));
+
+  ssize_t rc;
+  do {
+    rc = sendmsg(fd, &mh, 0);
+  } while (rc < 0 && errno == EINTR);
+
+  if (rc < 0) {
+    return 0;
+  }
+  return n;
+}
+
+static void udp_server_input_handler(evutil_socket_t fd, short what, void *arg) {
+  if (!(what & EV_READ)) {
+    return;
+  }
+  (void)arg; /* bind addr unused — recvmmsg fills msg_name with the actual
+                source for each datagram, which is also the echo destination. */
+
+  for (int round = 0; round < MAX_DRAIN_ROUNDS; ++round) {
+    for (int i = 0; i < PEER_BATCH; ++i) {
+      g_iovs[i].iov_base = g_bufs[i];
+      g_iovs[i].iov_len = sizeof(g_bufs[i]);
+      memset(&g_msgs[i].msg_hdr, 0, sizeof(g_msgs[i].msg_hdr));
+      g_msgs[i].msg_hdr.msg_iov = &g_iovs[i];
+      g_msgs[i].msg_hdr.msg_iovlen = 1;
+      g_msgs[i].msg_hdr.msg_name = &g_srcs[i];
+      g_msgs[i].msg_hdr.msg_namelen = sizeof(g_srcs[i]);
+      g_msgs[i].msg_hdr.msg_control = g_cmsgs[i];
+      g_msgs[i].msg_hdr.msg_controllen = sizeof(g_cmsgs[i]);
+      g_msgs[i].msg_len = 0;
+    }
+
+    int n;
+    do {
+      n = recvmmsg(fd, g_msgs, PEER_BATCH, MSG_DONTWAIT, NULL);
+    } while (n < 0 && errno == EINTR);
+
+    if (n <= 0) {
+      return;
+    }
+
+    /* Read each datagram's marking, then drop the recv control so the mmsghdr
+     * array can be reused for sending. If the whole batch shares one marking
+     * (a single steady flow — the common case, and what GSO already needs),
+     * push it to the socket once and fall through to the batched echo. A mixed
+     * batch takes a per-packet echo so each reply keeps its own marking. */
+    int uniform_tos = 1;
+    for (int i = 0; i < n; ++i) {
+      g_toss[i] = peer_recv_tos(&g_msgs[i].msg_hdr);
+      g_msgs[i].msg_hdr.msg_control = NULL;
+      g_msgs[i].msg_hdr.msg_controllen = 0;
+      if (i > 0 && g_toss[i] != g_toss[0]) {
+        uniform_tos = 0;
+      }
+    }
+    if (uniform_tos) {
+      peer_reflect_tos(fd, g_srcs[0].ss.sa_family, g_toss[0]);
+    } else {
+      for (int i = 0; i < n; ++i) {
+        peer_reflect_tos(fd, g_srcs[i].ss.sa_family, g_toss[i]);
+        ssize_t r;
+        do {
+          r = sendto(fd, g_bufs[i], (size_t)g_msgs[i].msg_len, 0, (const struct sockaddr *)&g_srcs[i],
+                     g_msgs[i].msg_hdr.msg_namelen);
+        } while (r < 0 && errno == EINTR);
+      }
+      if (n < PEER_BATCH) {
+        return;
+      }
+      continue;
+    }
+
+    int sent = try_gso_echo(fd, n);
+    if (!sent) {
+      /* Reuse the same mmsghdr array for sendmmsg: each entry already has
+       * msg_name pointing at the source (which is the echo destination) and
+       * the iovec pointing at the received bytes. Shrink iov_len to the
+       * actual recv'd size and fire. No userspace copy. */
+      for (int i = 0; i < n; ++i) {
+        g_iovs[i].iov_len = (size_t)g_msgs[i].msg_len;
+      }
+      int s = 0;
+      while (s < n) {
+        int r;
+        do {
+          r = sendmmsg(fd, &g_msgs[s], (unsigned int)(n - s), 0);
+        } while (r < 0 && errno == EINTR);
+        if (r <= 0) {
+          break;
+        }
+        s += r;
+      }
+    }
+
+    if (n < PEER_BATCH) {
+      /* recvmmsg returned a partial batch — kernel queue is drained. */
+      return;
+    }
+  }
+}
+
+#else /* !__linux__ */
+
+/* No ancillary-data recv path here, so TOS is not reflected off-Linux — the
+ * same tradeoff the relay makes (RFC 5766 "alternative behavior"). */
+static void enable_recv_tos(evutil_socket_t fd, int family) {
+  UNUSED_ARG(fd);
+  UNUSED_ARG(family);
+}
 
 static void udp_server_input_handler(evutil_socket_t fd, short what, void *arg) {
 
@@ -48,7 +315,9 @@ static void udp_server_input_handler(evutil_socket_t fd, short what, void *arg) 
 
   ioa_addr *addr = (ioa_addr *)arg;
 
-  stun_buffer buffer;
+  /* One event_base dispatches every peer socket serially, so a module-static
+   * echo buffer is race-free and keeps ~64 KB out of the callback frame. */
+  static stun_buffer buffer;
   ioa_addr remote_addr;
   uint32_t slen = get_ioa_addr_len(addr);
   ssize_t len = 0;
@@ -66,10 +335,12 @@ static void udp_server_input_handler(evutil_socket_t fd, short what, void *arg) 
   }
 }
 
+#endif /* __linux__ */
+
 ///////////////////// operations //////////////////////////
 
 static int udp_create_server_socket(server_type *const server, const char *const ifname,
-                                    const char *const local_address, const int port) {
+                                    const char *const local_address, const uint16_t port) {
 
   if (!server) {
     return -1;
@@ -79,10 +350,7 @@ static int udp_create_server_socket(server_type *const server, const char *const
     TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Start\n");
   }
 
-  ioa_addr *server_addr = (ioa_addr *)malloc(sizeof(ioa_addr));
-  if (!server_addr) {
-    return -1;
-  }
+  ioa_addr *server_addr = (ioa_addr *)turn_malloc(sizeof(ioa_addr));
 
   STRCPY(server->ifname, ifname);
 
@@ -93,7 +361,7 @@ static int udp_create_server_socket(server_type *const server, const char *const
 
   evutil_socket_t udp_fd = socket(server_addr->ss.sa_family, RELAY_DGRAM_SOCKET_TYPE, RELAY_DGRAM_SOCKET_PROTOCOL);
   if (udp_fd < 0) {
-    perror("socket");
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "socket: %s\n", strerror(errno));
     free(server_addr);
     return -1;
   }
@@ -109,6 +377,9 @@ static int udp_create_server_socket(server_type *const server, const char *const
   }
 
   socket_set_nonblocking(udp_fd);
+
+  /* Echo back with the sender's DSCP/TOS: read it via IP_RECVTOS/IPV6_RECVTCLASS. */
+  enable_recv_tos(udp_fd, server_addr->ss.sa_family);
 
   struct event *udp_ev =
       event_new(server->event_base, udp_fd, EV_READ | EV_PERSIST, udp_server_input_handler, server_addr);
@@ -135,17 +406,14 @@ cleanup:
   return -1;
 }
 
-static server_type *init_server(int verbose, const char *ifname, char **local_addresses, size_t las, int port) {
+static server_type *init_server(int verbose, const char *ifname, char **local_addresses, size_t las, uint16_t port) {
   // Ports cannot be larger than unsigned 16 bits
   // and since this function creates two ports next to each other
   // the provided port must be smaller than max unsigned 16.
-  if ((uint16_t)port >= USHRT_MAX) {
+  if (port == USHRT_MAX) {
     return NULL;
   }
-  server_type *server = (server_type *)calloc(1, sizeof(server_type));
-  if (!server) {
-    return NULL;
-  }
+  server_type *server = (server_type *)turn_calloc(1, sizeof(server_type));
 
   server->verbose = verbose;
   server->event_base = turn_event_base_new();
@@ -187,7 +455,7 @@ static void run_events(server_type *server) {
 
 /////////////////////////////////////////////////////////////
 
-server_type *start_udp_server(int verbose, const char *ifname, char **local_addresses, size_t las, int port) {
+server_type *start_udp_server(int verbose, const char *ifname, char **local_addresses, size_t las, uint16_t port) {
   return init_server(verbose, ifname, local_addresses, las, port);
 }
 

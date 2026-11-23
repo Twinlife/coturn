@@ -8,60 +8,6 @@ ARG debian_ver=trixie
 
 
 #
-# Stage 'dist-libprom' creates prometheus-client-c distribution.
-#
-
-# We compile prometheus-client-c from sources, because Debian doesn't provide
-# it as its package yet.
-#
-# TODO: Re-check this to be present in packages on next Debian major version update.
-
-# https://hub.docker.com/_/debian
-FROM debian:${debian_ver}-slim AS dist-libprom
-
-# Install tools for building.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends --no-install-suggests \
-            ca-certificates cmake g++ git make \
- && update-ca-certificates
-
-# Install prometheus-client-c build dependencies.
-RUN apt-get install -y --no-install-recommends --no-install-suggests \
-            libmicrohttpd-dev
-
-# Prepare prometheus-client-c sources for building.
-ARG prom_ver=0.1.3
-RUN mkdir -p /build/ && cd /build/ \
- && git init \
- && git remote add origin https://github.com/digitalocean/prometheus-client-c \
- && git fetch --depth=1 origin "v${prom_ver}" \
- && git checkout FETCH_HEAD
-
-# Build libprom.so from sources.
-RUN mkdir -p /build/prom/build/ && cd /build/prom/build/ \
- && TEST=0 cmake -G "Unix Makefiles" \
-                 -DCMAKE_INSTALL_PREFIX=/usr \
-                 -DCMAKE_SKIP_BUILD_RPATH=TRUE \
-                 -DCMAKE_C_FLAGS="-DPROM_LOG_ENABLE -g -O3" \
-                 .. \
- && make
-
-# Install prometheus-client-c.
-RUN LIBS_DIR=/out/$(dirname $(find /usr/ -name libc.so)) \
- && mkdir -p $LIBS_DIR/ \
- && cp -rf /build/prom/build/libprom.so \
-       $LIBS_DIR/ \
- && mkdir -p /out/usr/include/ \
- && cp -rf /build/prom/include/* \
-       /out/usr/include/ \
- # Preserve license file.
- && mkdir -p /out/usr/share/licenses/prometheus-client-c/ \
- && cp /build/LICENSE /out/usr/share/licenses/prometheus-client-c/
-
-
-
-
-#
 # Stage 'dist-coturn' creates Coturn distribution.
 #
 
@@ -78,13 +24,10 @@ RUN apt-get update \
 RUN apt-get install -y --no-install-recommends --no-install-suggests \
             libevent-dev \
             libssl-dev \
-            libpq-dev libmariadb-dev libsqlite3-dev \
+            libpq-dev libmariadb-dev libsqlite3-dev sqlite3 \
             libhiredis-dev \
             libmongoc-dev \
             libmicrohttpd-dev
-
-# Install prometheus-client-c distribution.
-COPY --from=dist-libprom /out/ /
 
 # Prepare local Coturn sources for building.
 COPY CMakeLists.txt \
@@ -116,7 +59,7 @@ RUN if [ "${coturn_git_ref}" != 'HEAD' ]; then true \
  && true; fi
 
 # Build Coturn from sources.
-RUN ./configure --prefix=/usr \
+RUN CFLAGS="-O3" ./configure --prefix=/usr \
                 --turndbdir=/var/lib/coturn \
                 --disable-rpath \
                 --sysconfdir=/etc/coturn \
@@ -144,9 +87,6 @@ RUN chmod +x /out/usr/local/bin/docker-entrypoint.sh \
 RUN ln -s /usr/local/bin/detect-external-ip.sh \
           /out/usr/local/bin/detect-external-ip
 RUN chown -R nobody:nogroup /out/var/lib/coturn/
-
-# Re-export prometheus-client-c distribution.
-COPY --from=dist-libprom /out/ /out/
 
 
 

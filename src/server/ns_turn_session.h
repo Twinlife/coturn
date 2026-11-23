@@ -40,6 +40,8 @@
 #include "ns_turn_maps.h"
 #include "ns_turn_utils.h"
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -65,9 +67,30 @@ struct _realm_options_t {
 
 typedef uint64_t turnsession_id;
 
-#define NONCE_MAX_SIZE (NONCE_LENGTH_32BITS * 4 + 1)
+/* The legacy random challenge nonce: 16 lowercase hex chars. */
+#define TURN_RANDOM_NONCE_LENGTH (NONCE_LENGTH_32BITS * 4)
+#define TURN_RANDOM_NONCE_SIZE (TURN_RANDOM_NONCE_LENGTH + 1)
+
+/* Big enough for both nonce formats the server can issue: the legacy random
+ * nonce (TURN_RANDOM_NONCE_LENGTH = 16 chars) and the stateless
+ * timestamp||MAC nonce (TURN_STATELESS_NONCE_LENGTH = 24 chars). The two
+ * differ in length, so emitters must use strlen(), not NONCE_MAX_SIZE - 1, and
+ * a generator must bound itself with its own format's size - bounding the
+ * random nonce with NONCE_MAX_SIZE widens it to 24 chars. */
+#define NONCE_MAX_SIZE (TURN_STATELESS_NONCE_SIZE)
 
 typedef uint64_t mobile_id_t;
+
+/* Outcome of a user-key lookup, reported through get_username_resume_cb so the 401 log line
+ * and the auth-failure metric can name the actual cause instead of a generic "not found". */
+typedef enum {
+  TURN_KEY_LOOKUP_NOT_FOUND = 0,
+  TURN_KEY_LOOKUP_OK,
+  /* Time-limited username timestamp has passed; rejected before integrity verification. */
+  TURN_KEY_LOOKUP_EXPIRED,
+  /* MESSAGE-INTEGRITY did not verify against any known secret or key. */
+  TURN_KEY_LOOKUP_INTEGRITY_MISMATCH,
+} turn_key_lookup_result;
 
 struct _ts_ur_super_session {
   void *server;
@@ -76,19 +99,30 @@ struct _ts_ur_super_session {
   ioa_socket_handle client_socket;
   allocation alloc;
   ioa_timer_handle to_be_allocated_timeout_ev;
-  int enforce_fingerprints;
-  int is_tcp_relay;
-  int to_be_closed;
+  bool enforce_fingerprints;
+  bool is_tcp_relay;
+  bool to_be_closed;
+  /* Stateless-nonce mode: this UDP session only exists to carry an auth
+   * challenge (401/438) whose nonce can be recomputed later, so it is torn
+   * down as soon as the challenge response has been written (issue #1999). */
+  bool close_after_auth_challenge;
   /* Auth */
   uint8_t nonce[NONCE_MAX_SIZE];
   turn_time_t nonce_expiration_time;
   uint8_t username[STUN_MAX_USERNAME_SIZE + 1];
   hmackey_t hmackey;
   int hmackey_set;
+  /* Why the last user-key lookup failed; consumed when the 401 rejection is reported. */
+  turn_key_lookup_result key_lookup_result;
   password_t pwd;
   int quota_used;
   int oauth;
-  turn_time_t max_session_time_auth;
+  uint64_t oauth_expiration_time;
+  /* Identifies the request being resumed after an asynchronous OAuth lookup. */
+  stun_tid oauth_lookup_tid;
+  uint8_t oauth_lookup_token_hash[32];
+  bool oauth_lookup_done;
+  bool oauth_lookup_success;
   /* Realm */
   realm_options_t realm_options;
   int origin_set;
@@ -121,13 +155,25 @@ struct _ts_ur_super_session {
   mobile_id_t mobile_id;
   mobile_id_t old_mobile_id;
   char s_mobile_id[33];
+  /* RFC 8016 mobility graceful handoff (dual-5-tuple transition state).
+   * During a resume the allocation stays on the original session while the
+   * resuming session (new client path) is kept alive and linked, so peer->client
+   * traffic keeps flowing on the old 5-tuple until the client sends on the new
+   * one (or a bounded deadline elapses). See docs/mobility-rfc8016.md. */
+  turnsession_id mobile_resume_target;    /* resuming session -> allocation session id being resumed */
+  turnsession_id mobile_pending_resume;   /* allocation session -> resuming session id */
+  turn_time_t mobile_transition_deadline; /* allocation session: promote/abort by this time */
   /* Bandwidth */
   band_limit_t bps;
+  /* Allocation-gauge labels taken from the client socket when the allocation
+   * is created. Teardown reuses them: that socket can already be gone. */
+  SOCKET_TYPE prom_alloc_socket_type;
+  int prom_alloc_family;
 };
 
 ////// Session info for statistics //////
 
-#define TURN_ADDR_STR_SIZE (65)
+#define TURN_ADDR_STR_SIZE (64)
 #define TURN_MAIN_PEERS_ARRAY_SIZE (5)
 
 typedef struct _addr_data {
@@ -149,7 +195,7 @@ struct turn_session_info {
   addr_data relay_addr_data_ipv4;
   addr_data relay_addr_data_ipv6;
   uint8_t username[STUN_MAX_USERNAME_SIZE + 1];
-  int enforce_fingerprints;
+  bool enforce_fingerprints;
   /* Stats */
   uint64_t received_packets;
   uint64_t sent_packets;

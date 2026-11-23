@@ -1,0 +1,1203 @@
+#include "ns_turn_ioaddr.h"
+#include "ns_turn_msg.h"
+#include "ns_turn_msg_defs.h"
+
+#include <unity.h>
+
+#include <limits.h>
+#include <openssl/evp.h>
+#include <openssl/opensslv.h>
+#include <stdint.h>
+#include <string.h>
+
+void setUp(void) {}
+void tearDown(void) {}
+
+/* uint8_t arrays carry no alignment guarantee, so a fixed `raw + 1` is only
+ * misaligned when the array base happens to land on an even address. Pick the
+ * offset at runtime so the returned pointer always sits on an odd address and
+ * the misaligned-access regression tests below are deterministic. Callers
+ * must size `raw` with two bytes of headroom. */
+static uint8_t *misalign(uint8_t *raw) { return raw + 1 + ((uintptr_t)raw & 1); }
+
+static void test_init_request_produces_valid_stun_header(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+
+  stun_init_request_str(STUN_METHOD_BINDING, buf, &len);
+
+  TEST_ASSERT_EQUAL_size_t(STUN_HEADER_LENGTH, len);
+  TEST_ASSERT_TRUE(stun_is_command_message_str(buf, len));
+  TEST_ASSERT_TRUE(stun_is_request_str(buf, len));
+  TEST_ASSERT_EQUAL_UINT16(STUN_METHOD_BINDING, stun_get_method_str(buf, len));
+}
+
+static void test_init_indication_is_not_request(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+
+  stun_init_indication_str(STUN_METHOD_BINDING, buf, &len);
+
+  TEST_ASSERT_TRUE(stun_is_command_message_str(buf, len));
+  TEST_ASSERT_FALSE(stun_is_request_str(buf, len));
+  TEST_ASSERT_TRUE(stun_is_indication_str(buf, len));
+}
+
+static void test_success_response_carries_transaction_id(void) {
+  uint8_t req[1024] = {0};
+  size_t req_len = 0;
+  stun_init_request_str(STUN_METHOD_ALLOCATE, req, &req_len);
+
+  stun_tid tid = {0};
+  stun_tid_from_message_str(req, req_len, &tid);
+
+  uint8_t resp[1024] = {0};
+  size_t resp_len = 0;
+  stun_init_success_response_str(STUN_METHOD_ALLOCATE, resp, &resp_len, &tid);
+
+  TEST_ASSERT_TRUE(stun_is_success_response_str(resp, resp_len));
+  TEST_ASSERT_EQUAL_UINT16(STUN_METHOD_ALLOCATE, stun_get_method_str(resp, resp_len));
+
+  stun_tid resp_tid = {0};
+  stun_tid_from_message_str(resp, resp_len, &resp_tid);
+  TEST_ASSERT_EQUAL_MEMORY(tid.tsx_id, resp_tid.tsx_id, STUN_TID_SIZE);
+}
+
+static void test_error_response_carries_error_code(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  stun_tid tid = {0};
+
+  stun_init_error_response_str(STUN_METHOD_ALLOCATE, buf, &len, 401, (const uint8_t *)"Unauthorized", &tid, true);
+
+  TEST_ASSERT_TRUE(stun_is_command_message_str(buf, len));
+
+  int err_code = 0;
+  uint8_t err_msg[128] = {0};
+  TEST_ASSERT_TRUE(stun_is_error_response_str(buf, len, &err_code, err_msg, sizeof(err_msg)));
+  TEST_ASSERT_EQUAL_INT(401, err_code);
+}
+
+static void test_error_response_without_reason_string_still_parses(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  stun_tid tid = {0};
+
+  stun_init_error_response_str(STUN_METHOD_ALLOCATE, buf, &len, 437, (const uint8_t *)"ignored", &tid, false);
+
+  TEST_ASSERT_TRUE(stun_is_command_message_str(buf, len));
+
+  int err_code = 0;
+  uint8_t err_msg[128] = {0};
+  TEST_ASSERT_TRUE(stun_is_error_response_str(buf, len, &err_code, err_msg, sizeof(err_msg)));
+  TEST_ASSERT_EQUAL_INT(437, err_code);
+}
+
+/* RFC 8489 Section 14: the declared length is the value length prior to padding. */
+static void test_error_code_length_excludes_padding(void) {
+  const uint8_t *reason = get_default_reason(508);
+  const int reason_len = (int)strlen((const char *)reason);
+  /* Only an unpadded reason phrase can distinguish the two lengths. */
+  TEST_ASSERT_NOT_EQUAL_INT(0, reason_len % 4);
+
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  stun_tid tid = {0};
+
+  stun_init_error_response_str(STUN_METHOD_ALLOCATE, buf, &len, 508, reason, &tid, true);
+
+  stun_attr_ref sar = stun_attr_get_first_by_type_str(buf, len, STUN_ATTRIBUTE_ERROR_CODE);
+  TEST_ASSERT_NOT_NULL(sar);
+  TEST_ASSERT_EQUAL_INT(4 + reason_len, stun_attr_get_len(sar));
+  TEST_ASSERT_EQUAL_MEMORY(reason, stun_attr_get_value(sar) + 4, (size_t)reason_len);
+
+  /* The attribute is still padded on the wire; only the declared length differs. */
+  TEST_ASSERT_EQUAL_size_t(0, len % 4);
+  TEST_ASSERT_EQUAL_size_t(STUN_HEADER_LENGTH + 4 + 28, len);
+
+  /* Pad bytes are zeroed, not stale buffer contents. */
+  const uint8_t *pad = stun_attr_get_value(sar) + 4 + reason_len;
+  for (size_t i = 0; i < (size_t)(28 - 4 - reason_len); ++i) {
+    TEST_ASSERT_EQUAL_UINT8(0, pad[i]);
+  }
+}
+
+/* RFC 3489 Section 11.2.9 requires a reason phrase length that is a multiple of 4. */
+static void test_old_stun_error_code_length_stays_padded(void) {
+  const uint8_t *reason = get_default_reason(508);
+  const int reason_len = (int)strlen((const char *)reason);
+
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  stun_tid tid = {0};
+
+  old_stun_init_error_response_str(STUN_METHOD_BINDING, buf, &len, 508, reason, &tid, 0, true);
+
+  /* ERROR-CODE is the only attribute, so it starts right after the header. */
+  const uint8_t *attr = buf + STUN_HEADER_LENGTH;
+  TEST_ASSERT_EQUAL_UINT16(STUN_ATTRIBUTE_ERROR_CODE, turn_read_u16(attr));
+  TEST_ASSERT_EQUAL_UINT16(4 + reason_len + (4 - (reason_len % 4)), turn_read_u16(attr + 2));
+}
+
+/* RFC 8656 Section 18.12 ADDRESS-ERROR-CODE, declared per RFC 8489 Section 14. */
+static void test_address_error_code_length_excludes_padding(void) {
+  const uint8_t *reason = get_default_reason(508);
+  const int reason_len = (int)strlen((const char *)reason);
+  TEST_ASSERT_NOT_EQUAL_INT(0, reason_len % 4);
+
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  stun_tid tid = {0};
+
+  stun_init_success_response_str(STUN_METHOD_ALLOCATE, buf, &len, &tid);
+  TEST_ASSERT_TRUE(
+      stun_attr_add_address_error_code(buf, &len, STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_IPV6, 508));
+
+  stun_attr_ref sar = stun_attr_get_first_by_type_str(buf, len, STUN_ATTRIBUTE_ADDRESS_ERROR_CODE);
+  TEST_ASSERT_NOT_NULL(sar);
+  TEST_ASSERT_EQUAL_INT(4 + reason_len, stun_attr_get_len(sar));
+
+  const uint8_t *value = stun_attr_get_value(sar);
+  TEST_ASSERT_EQUAL_UINT8(STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_IPV6, value[0]);
+  TEST_ASSERT_EQUAL_UINT8(5, value[2]);
+  TEST_ASSERT_EQUAL_UINT8(8, value[3]);
+  TEST_ASSERT_EQUAL_MEMORY(reason, value + 4, (size_t)reason_len);
+
+  TEST_ASSERT_EQUAL_size_t(0, len % 4);
+}
+
+static void test_truncated_buffer_is_not_command_message(void) {
+  uint8_t buf[10] = {0};
+  TEST_ASSERT_FALSE(stun_is_command_message_str(buf, sizeof(buf)));
+}
+
+static void test_zeroed_buffer_is_not_command_message(void) {
+  uint8_t buf[STUN_HEADER_LENGTH] = {0};
+  TEST_ASSERT_FALSE(stun_is_command_message_str(buf, sizeof(buf)));
+}
+
+static void test_channel_message_roundtrip(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  const uint16_t channel = 0x4000;
+  const int payload_len = 200;
+
+  TEST_ASSERT_TRUE(stun_init_channel_message_str(channel, buf, &len, payload_len, false));
+
+  uint16_t parsed_channel = 0;
+  size_t blen = len;
+  TEST_ASSERT_TRUE(stun_is_channel_message_str(buf, &blen, &parsed_channel, false));
+  TEST_ASSERT_EQUAL_UINT16(channel, parsed_channel);
+}
+
+static void test_channel_message_zeroes_padding_bytes(void) {
+  uint8_t buf[1024];
+  // Prefill with a stale marker, mimicking a reused pooled buffer.
+  memset(buf, 0xAA, sizeof(buf));
+  size_t len = 0;
+  const uint16_t channel = 0x4001;
+  const int payload_len = 5; // not a multiple of 4 -> padding is added
+
+  for (int i = 0; i < payload_len; i++) {
+    buf[4 + i] = (uint8_t)(0x10 + i);
+  }
+
+  TEST_ASSERT_TRUE(stun_init_channel_message_str(channel, buf, &len, payload_len, true));
+
+  // 4 header + 5 payload rounded up to a 4-byte boundary.
+  TEST_ASSERT_EQUAL_size_t(12, len);
+
+  // The 3 pad bytes must be zeroed, not the stale 0xAA, so nothing leaks.
+  for (size_t i = (size_t)(4 + payload_len); i < len; i++) {
+    TEST_ASSERT_EQUAL_UINT8(0, buf[i]);
+  }
+}
+
+/* ChannelData fits in STUN_BUFFER_SIZE only when 4 + payload (<= padded) <= MAX.
+ * MAX is not a multiple of 4, so padding can push an otherwise-accepted length
+ * past the buffer; near-INT_MAX lengths can also overflow the pad roundup. */
+static void test_channel_message_rejects_negative_and_oversized_length(void) {
+  uint8_t buf[MAX_STUN_MESSAGE_SIZE] = {0};
+  size_t len = 0;
+  const uint16_t channel = 0x4000;
+  const int max_unpadded = (int)MAX_STUN_MESSAGE_SIZE - 4;
+
+  len = 0;
+  TEST_ASSERT_FALSE(stun_init_channel_message_str(channel, buf, &len, -1, false));
+  TEST_ASSERT_EQUAL_size_t(0, len);
+  len = 0;
+  TEST_ASSERT_FALSE(stun_init_channel_message_str(channel, buf, &len, -1, true));
+  TEST_ASSERT_EQUAL_size_t(0, len);
+
+  len = 0;
+  TEST_ASSERT_FALSE(stun_init_channel_message_str(channel, buf, &len, max_unpadded + 1, false));
+  TEST_ASSERT_EQUAL_size_t(0, len);
+  len = 0;
+  TEST_ASSERT_FALSE(stun_init_channel_message_str(channel, buf, &len, max_unpadded + 1, true));
+  TEST_ASSERT_EQUAL_size_t(0, len);
+}
+
+static void test_channel_message_padding_accepts_aligned_near_max(void) {
+  uint8_t buf[MAX_STUN_MESSAGE_SIZE] = {0};
+  size_t len = 0;
+  const uint16_t channel = 0x4000;
+  const int max_unpadded = (int)MAX_STUN_MESSAGE_SIZE - 4;
+  const int max_padded_payload = max_unpadded & ~3;
+
+  TEST_ASSERT_EQUAL_INT(65503, max_unpadded);
+  TEST_ASSERT_EQUAL_INT(65500, max_padded_payload);
+
+  memset(buf, 0xCC, sizeof(buf));
+  TEST_ASSERT_TRUE(stun_init_channel_message_str(channel, buf, &len, max_padded_payload, true));
+  TEST_ASSERT_EQUAL_size_t((size_t)(4 + max_padded_payload), len);
+}
+
+static void test_channel_message_padding_rejects_unaligned_near_max(void) {
+  /* Issue #2113: unpadded 4+length check accepted 65501..65503; pad memset OOB. */
+  uint8_t buf[MAX_STUN_MESSAGE_SIZE] = {0};
+  size_t len = 0;
+  const uint16_t channel = 0x4000;
+  const int max_unpadded = (int)MAX_STUN_MESSAGE_SIZE - 4;
+  const int max_padded_payload = max_unpadded & ~3;
+
+  for (int payload_len = max_padded_payload + 1; payload_len <= max_unpadded; payload_len++) {
+    len = 0;
+    TEST_ASSERT_FALSE(stun_init_channel_message_str(channel, buf, &len, payload_len, true));
+    TEST_ASSERT_EQUAL_size_t(0, len);
+  }
+}
+
+static void test_channel_message_unpadded_accepts_exact_max(void) {
+  uint8_t buf[MAX_STUN_MESSAGE_SIZE] = {0};
+  size_t len = 0;
+  const uint16_t channel = 0x4000;
+  const int max_unpadded = (int)MAX_STUN_MESSAGE_SIZE - 4;
+
+  TEST_ASSERT_TRUE(stun_init_channel_message_str(channel, buf, &len, max_unpadded, false));
+  TEST_ASSERT_EQUAL_size_t((size_t)MAX_STUN_MESSAGE_SIZE, len);
+}
+
+static void test_channel_message_rejects_int_max_padding_overflow(void) {
+  /* Pad-only rewrite can overflow 4+((length+3)&~3) near INT_MAX and fail open
+   * (observed: INT_MAX + do_padding returns true under -O3). Bound length first. */
+  uint8_t buf[MAX_STUN_MESSAGE_SIZE] = {0};
+  size_t len = 0;
+  const uint16_t channel = 0x4000;
+
+  len = 0;
+  TEST_ASSERT_FALSE(stun_init_channel_message_str(channel, buf, &len, INT_MAX - 6, true));
+  TEST_ASSERT_EQUAL_size_t(0, len);
+  len = 0;
+  TEST_ASSERT_FALSE(stun_init_channel_message_str(channel, buf, &len, INT_MAX - 6, false));
+  TEST_ASSERT_EQUAL_size_t(0, len);
+  len = 0;
+  TEST_ASSERT_FALSE(stun_init_channel_message_str(channel, buf, &len, INT_MAX, true));
+  TEST_ASSERT_EQUAL_size_t(0, len);
+  len = 0;
+  TEST_ASSERT_FALSE(stun_init_channel_message_str(channel, buf, &len, INT_MAX, false));
+  TEST_ASSERT_EQUAL_size_t(0, len);
+}
+
+static void test_challenge_response_null_terminates_max_length_server_name(void) {
+  uint8_t buf[MAX_STUN_MESSAGE_SIZE] = {0};
+  size_t len = 0;
+  stun_tid tid = {0};
+
+  stun_init_error_response_str(STUN_METHOD_ALLOCATE, buf, &len, 401, (const uint8_t *)"Unauthorized", &tid, true);
+
+  uint8_t realm[] = "example.org";
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_REALM, realm, (int)(sizeof(realm) - 1)));
+
+  /* A malicious server can send a THIRD-PARTY-AUTHORIZATION value as long as the
+   * receiving buffer, leaving no room for an implicit terminator. */
+  uint8_t long_name[STUN_MAX_SERVER_NAME_SIZE];
+  memset(long_name, 'a', sizeof(long_name));
+  TEST_ASSERT_TRUE(
+      stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_THIRD_PARTY_AUTHORIZATION, long_name, (int)sizeof(long_name)));
+
+  uint8_t nonce[] = "0123456789abcdef";
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_NONCE, nonce, (int)(sizeof(nonce) - 1)));
+
+  int err_code = 0;
+  uint8_t err_msg[128] = {0};
+  uint8_t out_realm[STUN_MAX_REALM_SIZE + 1] = {0};
+  uint8_t out_nonce[STUN_MAX_NONCE_SIZE + 1] = {0};
+  uint8_t server_name[STUN_MAX_SERVER_NAME_SIZE + 1];
+  memset(server_name, 0xFF, sizeof(server_name));
+  bool oauth = false;
+
+  TEST_ASSERT_TRUE(stun_is_challenge_response_str(buf, len, &err_code, err_msg, sizeof(err_msg), out_realm, out_nonce,
+                                                  server_name, &oauth));
+  TEST_ASSERT_TRUE(oauth);
+  TEST_ASSERT_NOT_NULL(memchr(server_name, 0, sizeof(server_name)));
+  TEST_ASSERT_EQUAL_size_t(STUN_MAX_SERVER_NAME_SIZE, strlen((const char *)server_name));
+}
+
+/* The limits are byte counts, and RFC 8489 states them per attribute: USERNAME
+ * fewer than 509 bytes (Section 14.3); REALM and NONCE fewer than 128
+ * characters (Sections 14.9 and 14.10), which is up to 763 bytes of UTF-8.
+ * Spelled as literals so a change to the macros has to be deliberate. */
+static void test_length_limits_are_the_rfc8489_byte_counts(void) {
+  TEST_ASSERT_EQUAL_INT(508, STUN_MAX_USERNAME_SIZE);
+  TEST_ASSERT_EQUAL_INT(763, STUN_MAX_REALM_SIZE);
+  TEST_ASSERT_EQUAL_INT(763, STUN_MAX_NONCE_SIZE);
+}
+
+/* Builds a 401 challenge carrying realm_len realm bytes and nonce_len nonce
+ * bytes, and reports whether the client accepted it. */
+static bool parse_challenge_with(size_t realm_len, size_t nonce_len) {
+  uint8_t buf[MAX_STUN_MESSAGE_SIZE] = {0};
+  size_t len = 0;
+  stun_tid tid = {0};
+
+  stun_init_error_response_str(STUN_METHOD_ALLOCATE, buf, &len, 401, (const uint8_t *)"Unauthorized", &tid, true);
+
+  uint8_t value[STUN_MAX_REALM_SIZE + 2];
+  memset(value, 'a', sizeof(value));
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_REALM, value, (int)realm_len));
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_NONCE, value, (int)nonce_len));
+
+  int err_code = 0;
+  uint8_t err_msg[128] = {0};
+  uint8_t out_realm[STUN_MAX_REALM_SIZE + 1] = {0};
+  uint8_t out_nonce[STUN_MAX_NONCE_SIZE + 1] = {0};
+
+  return stun_is_challenge_response_str(buf, len, &err_code, err_msg, sizeof(err_msg), out_realm, out_nonce, NULL,
+                                        NULL);
+}
+
+/* A realm or nonce at the RFC 8489 maximum must parse: a 127-character UTF-8
+ * realm can occupy all 763 bytes. */
+static void test_challenge_accepts_max_length_realm_and_nonce(void) {
+  TEST_ASSERT_TRUE(parse_challenge_with(STUN_MAX_REALM_SIZE, STUN_MAX_NONCE_SIZE));
+}
+
+/* Past the maximum the challenge is rejected rather than silently truncated:
+ * truncation cuts a multi-byte codepoint in half and then fails the integrity
+ * check with an unrelated error. */
+static void test_challenge_rejects_oversized_realm(void) {
+  TEST_ASSERT_FALSE(parse_challenge_with(STUN_MAX_REALM_SIZE + 1, 16));
+}
+
+static void test_challenge_rejects_oversized_nonce(void) {
+  TEST_ASSERT_FALSE(parse_challenge_with(16, STUN_MAX_NONCE_SIZE + 1));
+}
+
+/* Build a minimal valid STUN message header with a chosen body length field,
+ * so we can drive stun_get_message_len_str() across the uint16_t-overflow
+ * boundary. */
+static void make_stun_header(uint8_t *buf, uint16_t body_len) {
+  /* Type: top two bits clear, not a valid channel number. Use BINDING. */
+  buf[0] = (uint8_t)(STUN_METHOD_BINDING >> 8);
+  buf[1] = (uint8_t)(STUN_METHOD_BINDING & 0xFF);
+  /* Body length (network byte order). */
+  buf[2] = (uint8_t)(body_len >> 8);
+  buf[3] = (uint8_t)(body_len & 0xFF);
+  /* Magic cookie. */
+  buf[4] = 0x21;
+  buf[5] = 0x12;
+  buf[6] = 0xA4;
+  buf[7] = 0x42;
+  /* Transaction id (bytes 8..19) left as-is by the caller. */
+}
+
+static void test_message_len_does_not_overflow_uint16(void) {
+  /* These body lengths exceed MAX_STUN_MESSAGE_SIZE once the header is added. */
+  const uint16_t overflow_body_lens[] = {65520, 65524, 65528, 65532};
+
+  for (size_t i = 0; i < sizeof(overflow_body_lens) / sizeof(overflow_body_lens[0]); ++i) {
+    uint8_t buf[STUN_HEADER_LENGTH] = {0};
+    make_stun_header(buf, overflow_body_lens[i]);
+
+    size_t app_len = 12345; /* sentinel; must not be written on the never-fit path */
+    const int mlen = stun_get_message_len_str(buf, sizeof(buf), 1, &app_len);
+
+    TEST_ASSERT_EQUAL_INT(0, mlen);
+    TEST_ASSERT_FALSE(mlen > 0 && mlen <= (int)sizeof(buf));
+    TEST_ASSERT_EQUAL_size_t(12345, app_len);
+  }
+}
+
+static void test_message_len_rejects_oversize_channel_that_cannot_fit(void) {
+  /* ChannelData length 65535 cannot fit MAX_STUN_MESSAGE_SIZE. */
+  uint8_t hdr[4] = {0x40, 0x00, 0xff, 0xff};
+  size_t app_len = 0;
+  TEST_ASSERT_EQUAL_INT(0, stun_get_message_len_str(hdr, sizeof(hdr), 1, &app_len));
+
+  uint8_t full[MAX_STUN_MESSAGE_SIZE] = {0};
+  full[0] = 0x40;
+  full[1] = 0x00;
+  full[2] = 0xff;
+  full[3] = 0xff;
+  TEST_ASSERT_EQUAL_INT(0, stun_get_message_len_str(full, sizeof(full), 1, &app_len));
+}
+
+static void test_message_len_incomplete_legal_channel_waits(void) {
+  /* Partial legal ChannelData stays incomplete (-1). */
+  uint8_t buf[4 + 500] = {0};
+  buf[0] = 0x40;
+  buf[1] = 0x00;
+  buf[2] = 0x03;
+  buf[3] = 0xe8; /* length 1000 */
+  size_t app_len = 0;
+  TEST_ASSERT_EQUAL_INT(-1, stun_get_message_len_str(buf, sizeof(buf), 1, &app_len));
+}
+
+static void test_message_len_accepts_full_well_formed_message(void) {
+  /* A genuine, fully-present STUN message is still parsed correctly. */
+  const uint16_t body_len = 8;
+  uint8_t buf[STUN_HEADER_LENGTH + 8] = {0};
+  make_stun_header(buf, body_len);
+
+  size_t app_len = 0;
+  const int mlen = stun_get_message_len_str(buf, sizeof(buf), 1, &app_len);
+
+  TEST_ASSERT_EQUAL_INT((int)(STUN_HEADER_LENGTH + body_len), mlen);
+  TEST_ASSERT_EQUAL_size_t((size_t)(STUN_HEADER_LENGTH + body_len), app_len);
+}
+
+/* ----------------------------- RFC 5780 ----------------------------------- */
+/* NAT behavior discovery (RFC 5780) relies on a handful of STUN attributes:
+ * CHANGE-REQUEST / RESPONSE-PORT / PADDING on the request side, and
+ * OTHER-ADDRESS / RESPONSE-ORIGIN (both plain address attributes) on the
+ * response side. These tests assert the encode/decode helpers still
+ * round-trip so the feature stays wired up. */
+
+static void test_rfc5780_change_request_roundtrip(void) {
+  /* Every combination of the change-ip / change-port flag bits must survive an
+   * encode/decode cycle. */
+  const bool combos[4][2] = {{false, false}, {true, false}, {false, true}, {true, true}};
+
+  for (size_t i = 0; i < 4; ++i) {
+    uint8_t buf[1024] = {0};
+    size_t len = 0;
+    stun_init_request_str(STUN_METHOD_BINDING, buf, &len);
+
+    TEST_ASSERT_TRUE(stun_attr_add_change_request_str(buf, &len, combos[i][0], combos[i][1]));
+
+    stun_attr_ref sar = stun_attr_get_first_by_type_str(buf, len, STUN_ATTRIBUTE_CHANGE_REQUEST);
+    TEST_ASSERT_NOT_NULL(sar);
+
+    bool change_ip = !combos[i][0];
+    bool change_port = !combos[i][1];
+    TEST_ASSERT_TRUE(stun_attr_get_change_request_str(sar, &change_ip, &change_port));
+    TEST_ASSERT_EQUAL(combos[i][0], change_ip);
+    TEST_ASSERT_EQUAL(combos[i][1], change_port);
+  }
+}
+
+static void test_rfc5780_response_port_roundtrip(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  stun_init_request_str(STUN_METHOD_BINDING, buf, &len);
+
+  const uint16_t rport = 0xBEEF;
+  TEST_ASSERT_TRUE(stun_attr_add_response_port_str(buf, &len, rport));
+
+  stun_attr_ref sar = stun_attr_get_first_by_type_str(buf, len, STUN_ATTRIBUTE_RESPONSE_PORT);
+  TEST_ASSERT_NOT_NULL(sar);
+  TEST_ASSERT_EQUAL_INT((int)rport, stun_attr_get_response_port_str(sar));
+}
+
+static void test_rfc5780_padding_roundtrip(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  stun_init_request_str(STUN_METHOD_BINDING, buf, &len);
+
+  const uint16_t padding_len = 37;
+  TEST_ASSERT_TRUE(stun_attr_add_padding_str(buf, &len, padding_len));
+
+  stun_attr_ref sar = stun_attr_get_first_by_type_str(buf, len, STUN_ATTRIBUTE_PADDING);
+  TEST_ASSERT_NOT_NULL(sar);
+  TEST_ASSERT_EQUAL_INT((int)padding_len, stun_attr_get_padding_len_str(sar));
+}
+
+static void test_rfc5780_other_address_and_response_origin_roundtrip(void) {
+  /* The server answers a NAT-discovery binding request with OTHER-ADDRESS (the
+   * alternate ip:port pair) and RESPONSE-ORIGIN (where the response was sent
+   * from). Both are ordinary STUN address attributes; confirm they encode and
+   * decode back to the exact addresses. */
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  stun_tid tid = {0};
+  stun_init_success_response_str(STUN_METHOD_BINDING, buf, &len, &tid);
+
+  ioa_addr other_address = {0};
+  ioa_addr response_origin = {0};
+  TEST_ASSERT_EQUAL_INT(0, make_ioa_addr((const uint8_t *)"203.0.113.5", 3479, &other_address));
+  TEST_ASSERT_EQUAL_INT(0, make_ioa_addr((const uint8_t *)"192.0.2.10", 3478, &response_origin));
+
+  TEST_ASSERT_TRUE(stun_attr_add_addr_str(buf, &len, STUN_ATTRIBUTE_OTHER_ADDRESS, &other_address));
+  TEST_ASSERT_TRUE(stun_attr_add_addr_str(buf, &len, STUN_ATTRIBUTE_RESPONSE_ORIGIN, &response_origin));
+
+  ioa_addr got_other = {0};
+  ioa_addr got_origin = {0};
+  TEST_ASSERT_TRUE(stun_attr_get_first_addr_str(buf, len, STUN_ATTRIBUTE_OTHER_ADDRESS, &got_other, NULL));
+  TEST_ASSERT_TRUE(stun_attr_get_first_addr_str(buf, len, STUN_ATTRIBUTE_RESPONSE_ORIGIN, &got_origin, NULL));
+
+  TEST_ASSERT_TRUE(addr_eq(&other_address, &got_other));
+  TEST_ASSERT_TRUE(addr_eq(&response_origin, &got_origin));
+}
+
+static void test_attr_accessors_survive_misaligned_pointer(void) {
+  /* stun_attr_get_type/get_len/get_value and stun_get_requested_address_family used to cast the wire-format byte
+   * pointer straight to a wider integer pointer and dereference it. An
+   * attribute that lands at a non-4-byte-aligned offset (e.g. preceding
+   * attributes sent without RFC 5766 padding) triggered undefined behavior
+   * and SIGBUS on strict-alignment architectures such as ARM64. Build a
+   * hand-crafted REQUESTED-ADDRESS-FAMILY attribute one byte off from an
+   * aligned base and confirm the accessors still decode it correctly
+   * instead of crashing.
+   */
+  uint8_t raw[2 + 8] = {0};
+  uint8_t *attr = misalign(raw);
+
+  attr[0] = (STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY >> 8) & 0xFF;
+  attr[1] = STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY & 0xFF;
+  attr[2] = 0x00;
+  attr[3] = 0x04; // length = 4
+  attr[4] = STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_IPV4;
+  attr[5] = 0x00;
+  attr[6] = 0x00;
+  attr[7] = 0x00;
+
+  TEST_ASSERT_EQUAL_INT(STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY, stun_attr_get_type(attr));
+  TEST_ASSERT_EQUAL_INT(4, stun_attr_get_len(attr));
+
+  const uint8_t *value = stun_attr_get_value(attr);
+  TEST_ASSERT_NOT_NULL(value);
+  TEST_ASSERT_EQUAL_UINT8(STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_IPV4, value[0]);
+
+  TEST_ASSERT_EQUAL_INT(STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_IPV4, stun_get_requested_address_family(attr));
+}
+
+static void test_value_accessors_survive_misaligned_pointer(void) {
+  /* stun_attr_get_channel_number/get_bandwidth/get_response_port_str read a
+   * uint16/uint32 straight out of the attribute value via a cast to a wider
+   * integer pointer, the same construct the type/len/value accessors were
+   * moved off. On a misaligned base (an attribute one byte off an aligned
+   * origin) that is undefined behavior and SIGBUS on strict-alignment
+   * architectures such as ARM64. Drive each accessor from a misaligned
+   * attribute and confirm it still decodes the field correctly.
+   */
+  {
+    uint8_t raw[2 + 8] = {0};
+    uint8_t *attr = misalign(raw);
+    attr[0] = (STUN_ATTRIBUTE_CHANNEL_NUMBER >> 8) & 0xFF;
+    attr[1] = STUN_ATTRIBUTE_CHANNEL_NUMBER & 0xFF;
+    attr[2] = 0x00;
+    attr[3] = 0x04; // length = 4
+    attr[4] = 0x40; // channel 0x4000 (valid)
+    attr[5] = 0x00;
+    stun_attr_ref sar = attr;
+    TEST_ASSERT_EQUAL_UINT16(0x4000, stun_attr_get_channel_number(sar));
+  }
+  {
+    uint8_t raw[2 + 8] = {0};
+    uint8_t *attr = misalign(raw);
+    attr[0] = (STUN_ATTRIBUTE_BANDWIDTH >> 8) & 0xFF;
+    attr[1] = STUN_ATTRIBUTE_BANDWIDTH & 0xFF;
+    attr[2] = 0x00;
+    attr[3] = 0x04; // length = 4
+    attr[7] = 0x01; // 1 -> get_bandwidth returns 1 << 7
+    stun_attr_ref sar = attr;
+    TEST_ASSERT_EQUAL_UINT64(128, (uint64_t)stun_attr_get_bandwidth(sar));
+  }
+  {
+    uint8_t raw[2 + 8] = {0};
+    uint8_t *attr = misalign(raw);
+    attr[0] = (STUN_ATTRIBUTE_RESPONSE_PORT >> 8) & 0xFF;
+    attr[1] = STUN_ATTRIBUTE_RESPONSE_PORT & 0xFF;
+    attr[2] = 0x00;
+    attr[3] = 0x04; // length = 4
+    attr[4] = 0x30; // port 12345
+    attr[5] = 0x39;
+    stun_attr_ref sar = attr;
+    TEST_ASSERT_EQUAL_INT(12345, stun_attr_get_response_port_str(sar));
+  }
+}
+
+static void test_message_build_and_parse_survive_misaligned_buffer(void) {
+  /* The message builders and header parsers (stun_init_command_str,
+   * stun_attr_add_str, stun_attr_add_fingerprint_str, stun_get_method_str,
+   * stun_is_command_message_str, stun_get_message_len_str, ...) used to
+   * access the wire buffer through casts to wider integer pointers — the
+   * store-side twin of the attribute-accessor reads already pinned by the
+   * misaligned tests above. Build and re-parse a complete message on a buffer
+   * one byte off an aligned base and confirm every step still works.
+   */
+  uint8_t raw[2 + 1024] = {0};
+  uint8_t *buf = misalign(raw);
+  size_t len = 0;
+
+  stun_init_request_str(STUN_METHOD_BINDING, buf, &len);
+  TEST_ASSERT_EQUAL_size_t(STUN_HEADER_LENGTH, len);
+
+  const uint16_t rport = 12345;
+  TEST_ASSERT_TRUE(stun_attr_add_response_port_str(buf, &len, rport));
+  TEST_ASSERT_TRUE(stun_attr_add_fingerprint_str(buf, &len));
+
+  TEST_ASSERT_TRUE(stun_is_command_message_str(buf, len));
+  TEST_ASSERT_TRUE(stun_is_request_str(buf, len));
+  TEST_ASSERT_EQUAL_UINT16(STUN_METHOD_BINDING, stun_get_method_str(buf, len));
+  TEST_ASSERT_EQUAL_UINT16(stun_make_request(STUN_METHOD_BINDING), stun_get_msg_type_str(buf, len));
+  TEST_ASSERT_EQUAL_INT((int)len, stun_get_command_message_len_str(buf, len));
+  TEST_ASSERT_FALSE(is_channel_msg_str(buf, len));
+
+  bool fingerprint_present = false;
+  TEST_ASSERT_TRUE(stun_is_command_message_full_check_str(buf, len, true, &fingerprint_present));
+  TEST_ASSERT_TRUE(fingerprint_present);
+
+  stun_attr_ref sar = stun_attr_get_first_by_type_str(buf, len, STUN_ATTRIBUTE_RESPONSE_PORT);
+  TEST_ASSERT_NOT_NULL(sar);
+  TEST_ASSERT_EQUAL_INT((int)rport, stun_attr_get_response_port_str(sar));
+
+  size_t app_len = 0;
+  TEST_ASSERT_EQUAL_INT((int)len, stun_get_message_len_str(buf, len, 0, &app_len));
+  TEST_ASSERT_EQUAL_size_t(len, app_len);
+
+  /* Old (RFC 3489) header path: cookie is read and reported through the same
+   * previously-misaligned loads. */
+  {
+    uint8_t raw_old[2 + 64] = {0};
+    uint8_t *obuf = misalign(raw_old);
+    size_t olen = 0;
+    const uint32_t old_cookie = 0x12345678;
+    old_stun_init_command_str(stun_make_request(STUN_METHOD_BINDING), obuf, &olen, old_cookie);
+    uint32_t parsed_cookie = 0;
+    TEST_ASSERT_TRUE(old_stun_is_command_message_str(obuf, olen, &parsed_cookie));
+    TEST_ASSERT_EQUAL_UINT32(old_cookie, parsed_cookie);
+  }
+}
+
+static void test_channel_message_survives_misaligned_buffer(void) {
+  /* Channel-data framing (stun_init_channel_message_str,
+   * stun_is_channel_message_str, is_channel_msg_str, and the channel branch of
+   * stun_get_message_len_str) reads and writes the channel number and data
+   * length through what used to be direct wide-pointer access. Exercise the
+   * whole round trip on a misaligned buffer.
+   */
+  uint8_t raw[2 + 1024] = {0};
+  uint8_t *buf = misalign(raw);
+  size_t len = 0;
+  const uint16_t channel = 0x4001;
+  const int payload_len = 200;
+
+  TEST_ASSERT_TRUE(stun_init_channel_message_str(channel, buf, &len, payload_len, false));
+  TEST_ASSERT_EQUAL_size_t((size_t)(4 + payload_len), len);
+
+  TEST_ASSERT_TRUE(is_channel_msg_str(buf, len));
+  TEST_ASSERT_FALSE(stun_is_command_message_str(buf, len));
+
+  uint16_t parsed_channel = 0;
+  size_t blen = len;
+  TEST_ASSERT_TRUE(stun_is_channel_message_str(buf, &blen, &parsed_channel, false));
+  TEST_ASSERT_EQUAL_UINT16(channel, parsed_channel);
+
+  size_t app_len = 0;
+  TEST_ASSERT_EQUAL_INT((int)len, stun_get_message_len_str(buf, len, 0, &app_len));
+  TEST_ASSERT_EQUAL_size_t(len, app_len);
+}
+
+static void test_addr_attrs_survive_misaligned_buffer(void) {
+  /* stun_addr_encode/stun_addr_decode wrote and read the port and IPv4
+   * address fields through casts to wider integer pointers into the attribute
+   * body. Round-trip XOR-mapped (port and address are XORed with the magic
+   * cookie / transaction id) and plain address attributes, IPv4 and IPv6, on
+   * a message that sits one byte off an aligned base.
+   */
+  uint8_t raw[2 + 1024] = {0};
+  uint8_t *buf = misalign(raw);
+  size_t len = 0;
+  stun_tid tid = {0};
+  stun_init_success_response_str(STUN_METHOD_BINDING, buf, &len, &tid);
+
+  ioa_addr peer4 = {0};
+  ioa_addr peer6 = {0};
+  ioa_addr origin4 = {0};
+  TEST_ASSERT_EQUAL_INT(0, make_ioa_addr((const uint8_t *)"203.0.113.5", 43210, &peer4));
+  TEST_ASSERT_EQUAL_INT(0, make_ioa_addr((const uint8_t *)"2001:db8::1", 43211, &peer6));
+  TEST_ASSERT_EQUAL_INT(0, make_ioa_addr((const uint8_t *)"192.0.2.10", 3478, &origin4));
+
+  TEST_ASSERT_TRUE(stun_attr_add_addr_str(buf, &len, STUN_ATTRIBUTE_XOR_MAPPED_ADDRESS, &peer4));
+  TEST_ASSERT_TRUE(stun_attr_add_addr_str(buf, &len, STUN_ATTRIBUTE_XOR_PEER_ADDRESS, &peer6));
+  TEST_ASSERT_TRUE(stun_attr_add_addr_str(buf, &len, STUN_ATTRIBUTE_RESPONSE_ORIGIN, &origin4));
+
+  ioa_addr got4 = {0};
+  ioa_addr got6 = {0};
+  ioa_addr got_origin = {0};
+  TEST_ASSERT_TRUE(stun_attr_get_first_addr_str(buf, len, STUN_ATTRIBUTE_XOR_MAPPED_ADDRESS, &got4, NULL));
+  TEST_ASSERT_TRUE(stun_attr_get_first_addr_str(buf, len, STUN_ATTRIBUTE_XOR_PEER_ADDRESS, &got6, NULL));
+  TEST_ASSERT_TRUE(stun_attr_get_first_addr_str(buf, len, STUN_ATTRIBUTE_RESPONSE_ORIGIN, &got_origin, NULL));
+
+  TEST_ASSERT_TRUE(addr_eq(&peer4, &got4));
+  TEST_ASSERT_TRUE(addr_eq(&peer6, &got6));
+  TEST_ASSERT_TRUE(addr_eq(&origin4, &got_origin));
+}
+
+static void test_http_message_len_handles_non_null_terminated_buffer(void) {
+  uint8_t buf[] = {'G', 'E', 'T', ' ', '/', ' ', 'H', 'T', 'T', 'P', '/', '1', '.', '1', '\r', '\n', '\r', '\n'};
+  size_t app_len = 0;
+
+  TEST_ASSERT_EQUAL_INT((int)sizeof(buf), stun_get_message_len_str(buf, sizeof(buf), 1, &app_len));
+  TEST_ASSERT_EQUAL_size_t(sizeof(buf), app_len);
+  TEST_ASSERT_EQUAL_INT((int)sizeof(buf), is_http((const char *)buf, sizeof(buf)));
+}
+
+/* Digits placed right after the message, so a Content-Length parse that runs past blen changes the result. */
+static int http_len_with_trailing_digits(const char *msg) {
+  static const char trailing[] = "123";
+  char buf[160] = {0};
+  const size_t len = strlen(msg);
+
+  TEST_ASSERT_TRUE(len + sizeof(trailing) <= sizeof(buf));
+  memcpy(buf, msg, len);
+  memcpy(buf + len, trailing, sizeof(trailing));
+  return is_http(buf, len);
+}
+
+static void test_http_empty_content_length_stays_inside_buffer(void) {
+  const char *msg = "GET  HTTP/content-length: \r\n\r\n";
+
+  TEST_ASSERT_EQUAL_size_t(30, strlen(msg));
+  TEST_ASSERT_EQUAL_INT(30, http_len_with_trailing_digits(msg));
+}
+
+static void test_http_blank_content_length_stays_inside_buffer(void) {
+  const char *spaces = "GET / HTTP/1.1\r\nContent-Length:    \r\n\r\n";
+  const char *tabs = "GET / HTTP/1.1\r\nContent-Length: \t\t\r\n\r\n";
+  const char *no_space = "GET / HTTP/1.1\r\nContent-Length:\r\n\r\n";
+
+  TEST_ASSERT_EQUAL_INT((int)strlen(spaces), http_len_with_trailing_digits(spaces));
+  TEST_ASSERT_EQUAL_INT((int)strlen(tabs), http_len_with_trailing_digits(tabs));
+  TEST_ASSERT_EQUAL_INT((int)strlen(no_space), http_len_with_trailing_digits(no_space));
+}
+
+static void test_http_content_length_whitespace_after_colon_is_optional(void) {
+  const char *no_space = "POST / HTTP/1.1\r\nContent-Length:5\r\n\r\nhello";
+  const char *tab = "POST / HTTP/1.1\r\nContent-Length:\t5\r\n\r\nhello";
+
+  TEST_ASSERT_EQUAL_INT((int)strlen(no_space), http_len_with_trailing_digits(no_space));
+  TEST_ASSERT_EQUAL_INT((int)strlen(tab), http_len_with_trailing_digits(tab));
+}
+
+static void test_http_content_length_adds_body(void) {
+  const char *msg = "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+  const char *padded = "POST / HTTP/1.1\r\nContent-Length:   5\r\n\r\nhello";
+  const char *not_last = "POST / HTTP/1.1\r\nContent-Length: 5\r\nHost: a\r\n\r\nhello";
+  const char *trailing_ws = "POST / HTTP/1.1\r\nContent-Length: 5 \t\r\n\r\nhello";
+
+  TEST_ASSERT_EQUAL_INT((int)strlen(msg), http_len_with_trailing_digits(msg));
+  TEST_ASSERT_EQUAL_INT((int)strlen(padded), http_len_with_trailing_digits(padded));
+  TEST_ASSERT_EQUAL_INT((int)strlen(not_last), http_len_with_trailing_digits(not_last));
+  TEST_ASSERT_EQUAL_INT((int)strlen(trailing_ws), http_len_with_trailing_digits(trailing_ws));
+}
+
+static void test_http_oversized_content_length_is_ignored(void) {
+  const char *huge = "GET / HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n";
+  const char *limit = "GET / HTTP/1.1\r\nContent-Length: 268435455\r\n\r\n";
+  const char *wraps32 = "GET / HTTP/1.1\r\nContent-Length: 4294967301\r\n\r\n";
+
+  TEST_ASSERT_EQUAL_INT((int)strlen(huge), http_len_with_trailing_digits(huge));
+  TEST_ASSERT_EQUAL_INT((int)strlen(limit), http_len_with_trailing_digits(limit));
+  TEST_ASSERT_EQUAL_INT((int)strlen(wraps32), http_len_with_trailing_digits(wraps32));
+}
+
+static void test_http_content_length_with_trailing_garbage_is_ignored(void) {
+  const char *suffix = "GET / HTTP/1.1\r\nContent-Length: 5abc\r\n\r\n";
+  const char *two_values = "GET / HTTP/1.1\r\nContent-Length: 5 6\r\n\r\n";
+  const char *list = "GET / HTTP/1.1\r\nContent-Length: 5, 5\r\nHost: a\r\n\r\n";
+
+  TEST_ASSERT_EQUAL_INT((int)strlen(suffix), http_len_with_trailing_digits(suffix));
+  TEST_ASSERT_EQUAL_INT((int)strlen(two_values), http_len_with_trailing_digits(two_values));
+  TEST_ASSERT_EQUAL_INT((int)strlen(list), http_len_with_trailing_digits(list));
+}
+
+static void test_http_signed_content_length_is_ignored(void) {
+  const char *negative = "GET / HTTP/1.1\r\nContent-Length: -5\r\n\r\n";
+  const char *positive = "GET / HTTP/1.1\r\nContent-Length: +5\r\n\r\n";
+
+  TEST_ASSERT_EQUAL_INT((int)strlen(negative), http_len_with_trailing_digits(negative));
+  TEST_ASSERT_EQUAL_INT((int)strlen(positive), http_len_with_trailing_digits(positive));
+}
+
+/*
+ * RFC 8489 Section 9: "agents MUST ignore all attributes that follow
+ * MESSAGE-INTEGRITY, with the exception of the MESSAGE-INTEGRITY-SHA256 and
+ * FINGERPRINT attributes."
+ *
+ * The HMAC covers only the bytes up to the end of MESSAGE-INTEGRITY, so an
+ * on-path attacker can append attributes to an authenticated request and the
+ * integrity check still passes. The parse boundary, not the HMAC, is what has
+ * to reject them -- these pin that boundary.
+ */
+
+/* RFC 8489 MESSAGE-INTEGRITY-SHA256. Not implemented yet, so it has no name in
+ * ns_turn_msg_defs.h; declared here to pin the behaviour a conformant client
+ * that sends it will meet. */
+#define TEST_ATTR_MESSAGE_INTEGRITY_SHA256 (0x001C)
+
+static const uint8_t TEST_UNAME[] = "pavel";
+static const uint8_t TEST_REALM[] = "north.gov";
+static const uint8_t TEST_UPWD[] = "secret";
+static const uint8_t TEST_NONCE[] = "0123456789abcdef";
+
+static const uint8_t TEST_TRANSPORT_UDP[4] = {STUN_ATTRIBUTE_TRANSPORT_UDP_VALUE, 0, 0, 0};
+static const uint8_t TEST_LIFETIME_600[4] = {0, 0, 0x02, 0x58};
+static const uint8_t TEST_LIFETIME_1[4] = {0, 0, 0, 1};
+
+static void test_integrity_key(hmackey_t key) {
+  memset(key, 0, sizeof(hmackey_t));
+  TEST_ASSERT_TRUE(stun_produce_integrity_key_str(TEST_UNAME, TEST_REALM, TEST_UPWD, key, SHATYPE_DEFAULT));
+}
+
+static void test_md5_integrity_key_preserves_openssl3_fips_default(void) {
+  hmackey_t key = {0};
+  const hmackey_t zero_key = {0};
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+  /* Force FIPS defaults on so a sticky enable_fips(NULL,0) would be visible. */
+  const int fips_was_enabled = EVP_default_properties_is_fips_enabled(NULL);
+  if (!EVP_default_properties_enable_fips(NULL, 1) || !EVP_default_properties_is_fips_enabled(NULL)) {
+    (void)EVP_default_properties_enable_fips(NULL, fips_was_enabled);
+    TEST_IGNORE_MESSAGE("OpenSSL FIPS default properties unavailable");
+  }
+
+  const bool ok = stun_produce_integrity_key_str(TEST_UNAME, TEST_REALM, TEST_UPWD, key, SHATYPE_DEFAULT);
+  const int fips_after = EVP_default_properties_is_fips_enabled(NULL);
+  (void)EVP_default_properties_enable_fips(NULL, fips_was_enabled);
+
+  TEST_ASSERT_TRUE(ok);
+  TEST_ASSERT_EQUAL_INT(1, fips_after);
+#else
+  test_integrity_key(key);
+#endif
+  TEST_ASSERT_NOT_EQUAL(0, memcmp(key, zero_key, get_hmackey_size(SHATYPE_DEFAULT)));
+}
+
+/* An ALLOCATE requesting a 600 s lifetime, sealed with MESSAGE-INTEGRITY. */
+static void build_authenticated_allocate(uint8_t *buf, size_t *len) {
+  hmackey_t key;
+  test_integrity_key(key);
+
+  *len = 0;
+  stun_init_request_str(STUN_METHOD_ALLOCATE, buf, len);
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, len, STUN_ATTRIBUTE_REQUESTED_TRANSPORT, TEST_TRANSPORT_UDP, 4));
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, len, STUN_ATTRIBUTE_LIFETIME, TEST_LIFETIME_600, 4));
+  TEST_ASSERT_TRUE(
+      stun_attr_add_integrity_by_key_str(buf, len, TEST_UNAME, TEST_REALM, key, TEST_NONCE, SHATYPE_DEFAULT));
+}
+
+static int count_attrs_of_type(const uint8_t *buf, size_t len, uint16_t type, bool covered_only) {
+  int n = 0;
+  stun_attr_ref sar = stun_attr_get_first_str(buf, len);
+  while (sar) {
+    if (stun_attr_get_type(sar) == (int)type) {
+      ++n;
+    }
+    sar = covered_only ? stun_attr_get_next_covered_str(buf, len, sar) : stun_attr_get_next_str(buf, len, sar);
+  }
+  return n;
+}
+
+static void test_trailing_attr_survives_integrity_check(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  hmackey_t key;
+
+  build_authenticated_allocate(buf, &len);
+  test_integrity_key(key);
+
+  /* Appending an attribute rewrites the header length; no key is needed,
+     because the HMAC does not reach past MESSAGE-INTEGRITY. */
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_LIFETIME, TEST_LIFETIME_1, 4));
+
+  /* The tampered message still authenticates. This is the whole reason the
+     parse loops must stop at MESSAGE-INTEGRITY on their own. */
+  TEST_ASSERT_EQUAL_INT(
+      1, stun_check_message_integrity_by_key_str(TURN_CREDENTIALS_LONG_TERM, buf, len, key, NULL, SHATYPE_DEFAULT));
+}
+
+static void test_covered_walk_ignores_attr_after_message_integrity(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+
+  build_authenticated_allocate(buf, &len);
+  TEST_ASSERT_EQUAL_INT(1, count_attrs_of_type(buf, len, STUN_ATTRIBUTE_LIFETIME, true));
+
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_LIFETIME, TEST_LIFETIME_1, 4));
+
+  /* An unbounded walk hands the attacker's LIFETIME to the handler, which
+     assigns unconditionally, so the trailing value wins. */
+  TEST_ASSERT_EQUAL_INT(2, count_attrs_of_type(buf, len, STUN_ATTRIBUTE_LIFETIME, false));
+  /* A covered walk never sees it. */
+  TEST_ASSERT_EQUAL_INT(1, count_attrs_of_type(buf, len, STUN_ATTRIBUTE_LIFETIME, true));
+}
+
+static void test_covered_walk_yields_message_integrity_itself(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+
+  build_authenticated_allocate(buf, &len);
+
+  /* The boundary is inclusive: callers still dispatch on MESSAGE-INTEGRITY
+     (SKIP_ATTRIBUTES relies on seeing it) and stop only afterwards. */
+  TEST_ASSERT_EQUAL_INT(1, count_attrs_of_type(buf, len, STUN_ATTRIBUTE_MESSAGE_INTEGRITY, true));
+}
+
+static void test_covered_walk_is_full_walk_without_message_integrity(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+
+  /* Nothing is protected, so there is no boundary to honour. */
+  stun_init_request_str(STUN_METHOD_ALLOCATE, buf, &len);
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_REQUESTED_TRANSPORT, TEST_TRANSPORT_UDP, 4));
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_LIFETIME, TEST_LIFETIME_600, 4));
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_LIFETIME, TEST_LIFETIME_1, 4));
+
+  TEST_ASSERT_EQUAL_INT(2, count_attrs_of_type(buf, len, STUN_ATTRIBUTE_LIFETIME, true));
+  TEST_ASSERT_EQUAL_INT(1, count_attrs_of_type(buf, len, STUN_ATTRIBUTE_REQUESTED_TRANSPORT, true));
+}
+
+static void test_covered_walk_hides_message_integrity_sha256_from_420(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  uint8_t sha256_hmac[32] = {0};
+
+  build_authenticated_allocate(buf, &len);
+
+  /* An RFC 8489 client sends MESSAGE-INTEGRITY-SHA256 after MESSAGE-INTEGRITY.
+     0x001C is comprehension-required, so an unbounded walk collects it as an
+     unknown attribute and the server answers 420 -- rejecting a conformant
+     client. The covered walk never reaches it, which is what the RFC requires
+     and what keeps such clients working. */
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, &len, TEST_ATTR_MESSAGE_INTEGRITY_SHA256, sha256_hmac, 32));
+
+  TEST_ASSERT_EQUAL_INT(1, count_attrs_of_type(buf, len, TEST_ATTR_MESSAGE_INTEGRITY_SHA256, false));
+  TEST_ASSERT_EQUAL_INT(0, count_attrs_of_type(buf, len, TEST_ATTR_MESSAGE_INTEGRITY_SHA256, true));
+}
+
+static bool attr_value_equals(stun_attr_ref sar, const char *expected) {
+  const int alen = stun_attr_get_len(sar);
+  return (alen == (int)strlen(expected)) && (memcmp(stun_attr_get_value(sar), expected, (size_t)alen) == 0);
+}
+
+static void test_covered_by_type_ignores_attr_after_message_integrity(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  uint8_t hmac[SHA1SIZEBYTES] = {0};
+
+  /* A USERNAME that exists only past the HMAC boundary: nothing signed it, so
+     check_stun_auth() must not derive a key from it. */
+  stun_init_request_str(STUN_METHOD_ALLOCATE, buf, &len);
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_MESSAGE_INTEGRITY, hmac, SHA1SIZEBYTES));
+  TEST_ASSERT_TRUE(
+      stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_USERNAME, TEST_UNAME, (int)strlen((const char *)TEST_UNAME)));
+
+  TEST_ASSERT_NOT_NULL(stun_attr_get_first_by_type_str(buf, len, STUN_ATTRIBUTE_USERNAME));
+  TEST_ASSERT_NULL(stun_attr_get_first_covered_by_type_str(buf, len, STUN_ATTRIBUTE_USERNAME));
+}
+
+static void test_covered_by_type_keeps_protected_attr_over_trailing_copy(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+
+  build_authenticated_allocate(buf, &len);
+  TEST_ASSERT_TRUE(stun_attr_add_str(buf, &len, STUN_ATTRIBUTE_USERNAME, (const uint8_t *)"attacker", 8));
+
+  stun_attr_ref sar = stun_attr_get_first_covered_by_type_str(buf, len, STUN_ATTRIBUTE_USERNAME);
+  TEST_ASSERT_NOT_NULL(sar);
+  TEST_ASSERT_TRUE(attr_value_equals(sar, (const char *)TEST_UNAME));
+}
+
+static void test_covered_by_type_finds_message_integrity_itself(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+
+  build_authenticated_allocate(buf, &len);
+
+  /* The boundary is inclusive, so the auth path can still locate the HMAC. */
+  TEST_ASSERT_NOT_NULL(stun_attr_get_first_covered_by_type_str(buf, len, STUN_ATTRIBUTE_MESSAGE_INTEGRITY));
+}
+
+/* RFC 8656 par. 12: ChannelBind may only establish channels 0x4000-0x4FFF;
+   0x5000-0xFFFF is reserved for RFC 7983 demultiplexing. The receive-side
+   macro deliberately keeps the RFC 5766 range so legacy ChannelData frames
+   are still recognized and stream framing stays in sync. */
+static void test_channel_bind_macro_is_strict_rfc8656_range(void) {
+  TEST_ASSERT_FALSE(STUN_VALID_CHANNEL_BIND(0x3FFF));
+  TEST_ASSERT_TRUE(STUN_VALID_CHANNEL_BIND(0x4000));
+  TEST_ASSERT_TRUE(STUN_VALID_CHANNEL_BIND(0x4FFF));
+  TEST_ASSERT_FALSE(STUN_VALID_CHANNEL_BIND(0x5000));
+  TEST_ASSERT_FALSE(STUN_VALID_CHANNEL_BIND(0x7FFF));
+
+  TEST_ASSERT_FALSE(STUN_VALID_CHANNEL(0x3FFF));
+  TEST_ASSERT_TRUE(STUN_VALID_CHANNEL(0x4000));
+  TEST_ASSERT_TRUE(STUN_VALID_CHANNEL(0x5000));
+  TEST_ASSERT_TRUE(STUN_VALID_CHANNEL(0x7FFF));
+  TEST_ASSERT_FALSE(STUN_VALID_CHANNEL(0x8000));
+}
+
+static void test_channel_bind_request_stays_in_rfc8656_range(void) {
+  const uint16_t requested[] = {0x0000, 0x3FFF, 0x5000, 0x7FFF, 0xFFFF};
+  for (size_t i = 0; i < sizeof(requested) / sizeof(requested[0]); ++i) {
+    uint8_t buf[1024] = {0};
+    size_t len = 0;
+    const uint16_t chosen = stun_set_channel_bind_request_str(buf, &len, NULL, requested[i]);
+    TEST_ASSERT_TRUE(STUN_VALID_CHANNEL_BIND(chosen));
+  }
+}
+
+static void test_channel_bind_request_keeps_explicit_valid_channel(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  TEST_ASSERT_EQUAL_UINT16(0x4ABC, stun_set_channel_bind_request_str(buf, &len, NULL, 0x4ABC));
+}
+
+static void test_legacy_rfc5766_channel_frame_still_recognized(void) {
+  uint8_t buf[1024] = {0};
+  size_t len = 0;
+  const uint16_t legacy_channel = 0x7ABC;
+  const int payload_len = 16;
+  TEST_ASSERT_TRUE(stun_init_channel_message_str(legacy_channel, buf, &len, payload_len, false));
+
+  uint16_t parsed_channel = 0;
+  size_t blen = len;
+  TEST_ASSERT_TRUE(stun_is_channel_message_str(buf, &blen, &parsed_channel, false));
+  TEST_ASSERT_EQUAL_UINT16(legacy_channel, parsed_channel);
+}
+
+static void test_binding_response_address_attrs_by_compat_mode(void) {
+  /* stun_backward_compatibility and the old_stun (RFC 3489) request path are
+     independent knobs, so each combination has to produce the right address
+     attributes on its own:
+
+       - XOR-MAPPED-ADDRESS is RFC 5389 only; RFC 3489 has no such attribute.
+       - MAPPED-ADDRESS is the ONLY address attribute RFC 3489 defines, so the
+         old-STUN path must always emit it, regardless of the modern-response
+         backward-compatibility flag. On the modern path it stays opt-in,
+         because it widens the response and raises the amplification gain. */
+  ioa_addr reflexive = {0};
+  TEST_ASSERT_EQUAL_INT(0, make_ioa_addr((const uint8_t *)"203.0.113.5", 43210, &reflexive));
+
+  const struct {
+    bool old_stun;
+    bool backward_compat;
+    int want_xor;
+    int want_mapped;
+  } cases[] = {
+      {false, false, 1, 0}, /* default: XOR only */
+      {false, true, 1, 1},  /* --stun-backward-compatibility: both */
+      {true, false, 0, 1},  /* --rfc3489-compatibility alone: MAPPED only */
+      {true, true, 0, 1},   /* both flags: still MAPPED only on the old path */
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    uint8_t buf[1024] = {0};
+    size_t len = 0;
+    stun_tid tid = {0};
+    const uint32_t cookie = 0x12345678;
+
+    TEST_ASSERT_TRUE(stun_set_binding_response_str(buf, &len, &tid, &reflexive, 0, NULL, cookie, cases[i].old_stun,
+                                                   cases[i].backward_compat, true));
+
+    TEST_ASSERT_EQUAL_INT(cases[i].want_xor, count_attrs_of_type(buf, len, STUN_ATTRIBUTE_XOR_MAPPED_ADDRESS, false));
+    TEST_ASSERT_EQUAL_INT(cases[i].want_mapped, count_attrs_of_type(buf, len, STUN_ATTRIBUTE_MAPPED_ADDRESS, false));
+
+    /* Whichever attribute is present must round-trip to the address we passed in,
+       and the old path must echo the caller's cookie rather than the magic one. */
+    const uint16_t addr_attr =
+        cases[i].want_xor ? STUN_ATTRIBUTE_XOR_MAPPED_ADDRESS : (uint16_t)STUN_ATTRIBUTE_MAPPED_ADDRESS;
+    stun_attr_ref sar = stun_attr_get_first_by_type_str(buf, len, addr_attr);
+    TEST_ASSERT_NOT_NULL(sar);
+    ioa_addr got = {0};
+    TEST_ASSERT_TRUE(stun_attr_get_addr_str(buf, len, sar, &got, NULL));
+    TEST_ASSERT_TRUE(addr_eq(&reflexive, &got));
+
+    if (cases[i].old_stun) {
+      uint32_t parsed_cookie = 0;
+      TEST_ASSERT_TRUE(old_stun_is_command_message_str(buf, len, &parsed_cookie));
+      TEST_ASSERT_EQUAL_UINT32(cookie, parsed_cookie);
+    } else {
+      TEST_ASSERT_TRUE(stun_is_command_message_str(buf, len));
+    }
+  }
+}
+
+static void test_oauth_token_timestamp_window(void) {
+  const uint64_t now = 1000;
+  uint64_t expiration = 0;
+
+  TEST_ASSERT_TRUE(stun_oauth_token_expiration(now, 60, now, &expiration));
+  TEST_ASSERT_EQUAL_UINT64(now + 65, expiration);
+  TEST_ASSERT_TRUE(stun_oauth_token_expiration(now - 64, 60, now, &expiration));
+  TEST_ASSERT_EQUAL_UINT64(now + 1, expiration);
+  TEST_ASSERT_TRUE(stun_oauth_token_expiration(now + 50, 60, now, &expiration));
+  TEST_ASSERT_EQUAL_UINT64(now + 15, expiration);
+  TEST_ASSERT_FALSE(stun_oauth_token_expiration(now - 65, 60, now, &expiration));
+  TEST_ASSERT_FALSE(stun_oauth_token_expiration(now + 65, 60, now, &expiration));
+  TEST_ASSERT_FALSE(stun_oauth_token_expiration(now - 100, 0, now, &expiration));
+  TEST_ASSERT_FALSE(stun_oauth_token_expiration(UINT64_MAX, 60, UINT64_MAX, &expiration));
+}
+
+int main(void) {
+  UNITY_BEGIN();
+  RUN_TEST(test_init_request_produces_valid_stun_header);
+  RUN_TEST(test_init_indication_is_not_request);
+  RUN_TEST(test_success_response_carries_transaction_id);
+  RUN_TEST(test_error_response_carries_error_code);
+  RUN_TEST(test_error_response_without_reason_string_still_parses);
+  RUN_TEST(test_error_code_length_excludes_padding);
+  RUN_TEST(test_old_stun_error_code_length_stays_padded);
+  RUN_TEST(test_address_error_code_length_excludes_padding);
+  RUN_TEST(test_truncated_buffer_is_not_command_message);
+  RUN_TEST(test_zeroed_buffer_is_not_command_message);
+  RUN_TEST(test_channel_message_roundtrip);
+  RUN_TEST(test_channel_message_zeroes_padding_bytes);
+  RUN_TEST(test_channel_message_rejects_negative_and_oversized_length);
+  RUN_TEST(test_channel_message_padding_accepts_aligned_near_max);
+  RUN_TEST(test_channel_message_padding_rejects_unaligned_near_max);
+  RUN_TEST(test_channel_message_unpadded_accepts_exact_max);
+  RUN_TEST(test_channel_message_rejects_int_max_padding_overflow);
+  RUN_TEST(test_challenge_response_null_terminates_max_length_server_name);
+  RUN_TEST(test_length_limits_are_the_rfc8489_byte_counts);
+  RUN_TEST(test_challenge_accepts_max_length_realm_and_nonce);
+  RUN_TEST(test_challenge_rejects_oversized_realm);
+  RUN_TEST(test_challenge_rejects_oversized_nonce);
+  RUN_TEST(test_message_len_does_not_overflow_uint16);
+  RUN_TEST(test_message_len_rejects_oversize_channel_that_cannot_fit);
+  RUN_TEST(test_message_len_incomplete_legal_channel_waits);
+  RUN_TEST(test_message_len_accepts_full_well_formed_message);
+  RUN_TEST(test_rfc5780_change_request_roundtrip);
+  RUN_TEST(test_rfc5780_response_port_roundtrip);
+  RUN_TEST(test_rfc5780_padding_roundtrip);
+  RUN_TEST(test_rfc5780_other_address_and_response_origin_roundtrip);
+  RUN_TEST(test_attr_accessors_survive_misaligned_pointer);
+  RUN_TEST(test_value_accessors_survive_misaligned_pointer);
+  RUN_TEST(test_message_build_and_parse_survive_misaligned_buffer);
+  RUN_TEST(test_channel_message_survives_misaligned_buffer);
+  RUN_TEST(test_addr_attrs_survive_misaligned_buffer);
+  RUN_TEST(test_http_message_len_handles_non_null_terminated_buffer);
+  RUN_TEST(test_http_empty_content_length_stays_inside_buffer);
+  RUN_TEST(test_http_blank_content_length_stays_inside_buffer);
+  RUN_TEST(test_http_content_length_whitespace_after_colon_is_optional);
+  RUN_TEST(test_http_content_length_adds_body);
+  RUN_TEST(test_http_oversized_content_length_is_ignored);
+  RUN_TEST(test_http_content_length_with_trailing_garbage_is_ignored);
+  RUN_TEST(test_http_signed_content_length_is_ignored);
+  RUN_TEST(test_md5_integrity_key_preserves_openssl3_fips_default);
+  RUN_TEST(test_trailing_attr_survives_integrity_check);
+  RUN_TEST(test_covered_walk_ignores_attr_after_message_integrity);
+  RUN_TEST(test_covered_walk_yields_message_integrity_itself);
+  RUN_TEST(test_covered_walk_is_full_walk_without_message_integrity);
+  RUN_TEST(test_covered_walk_hides_message_integrity_sha256_from_420);
+  RUN_TEST(test_covered_by_type_ignores_attr_after_message_integrity);
+  RUN_TEST(test_covered_by_type_keeps_protected_attr_over_trailing_copy);
+  RUN_TEST(test_covered_by_type_finds_message_integrity_itself);
+  RUN_TEST(test_channel_bind_macro_is_strict_rfc8656_range);
+  RUN_TEST(test_channel_bind_request_stays_in_rfc8656_range);
+  RUN_TEST(test_channel_bind_request_keeps_explicit_valid_channel);
+  RUN_TEST(test_legacy_rfc5766_channel_frame_still_recognized);
+  RUN_TEST(test_binding_response_address_attrs_by_compat_mode);
+  RUN_TEST(test_oauth_token_timestamp_window);
+  return UNITY_END();
+}

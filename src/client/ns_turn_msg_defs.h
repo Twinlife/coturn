@@ -46,9 +46,13 @@
 #define STUN_HEADER_LENGTH (20)
 #define STUN_CHANNEL_HEADER_LENGTH (4)
 
-#define STUN_MAX_USERNAME_SIZE (512)
-#define STUN_MAX_REALM_SIZE (127)
-#define STUN_MAX_NONCE_SIZE (127)
+/* Longest valid value in bytes, not in characters. RFC 8489 Section 14.3 caps
+ * USERNAME at fewer than 509 bytes; Sections 14.9 and 14.10 cap REALM and NONCE
+ * at fewer than 128 characters, which is up to 763 bytes once UTF-8 encoded.
+ * Buffers sized from these add one byte for the terminator. */
+#define STUN_MAX_USERNAME_SIZE (508)
+#define STUN_MAX_REALM_SIZE (763)
+#define STUN_MAX_NONCE_SIZE (763)
 #define STUN_MAX_SERVER_NAME_SIZE (1025)
 #define STUN_MAX_PWD_SIZE (256)
 #define AUTH_SECRET_SIZE STUN_MAX_PWD_SIZE
@@ -141,6 +145,21 @@
 #define STUN_ATTRIBUTE_ADDRESS_ERROR_CODE (0x8001)
 /* <<== RFC 8656 */
 
+/* Channel-number ranges.
+ *
+ * RFC 8656 par. 12 narrows the allowed ChannelBind range to 0x4000-0x4FFF;
+ * 0x5000-0xFFFF is reserved so that the first byte of a ChannelData message
+ * stays inside the [64..79] slot that RFC 7983 assigns to TURN in the
+ * DTLS-SRTP demultiplexing scheme. STUN_VALID_CHANNEL_BIND is that strict
+ * range: use it wherever a channel number is being established (ChannelBind,
+ * on both the client and the server side).
+ *
+ * STUN_VALID_CHANNEL keeps the RFC 5766 range (0x4000-0x7FFF) and is the
+ * lenient receive/framing-side check: ChannelData from legacy RFC 5766 peers
+ * must still be recognized as ChannelData so that stream framing stays in
+ * sync (the server option --rfc5766-channel-numbers re-enables binding in
+ * the legacy range). */
+#define STUN_VALID_CHANNEL_BIND(chn) ((chn) >= 0x4000 && (chn) <= 0x4FFF)
 #define STUN_VALID_CHANNEL(chn) ((chn) >= 0x4000 && (chn) <= 0x7FFF)
 
 ///////// extra values //////////////////

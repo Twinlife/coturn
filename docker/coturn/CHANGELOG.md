@@ -4,8 +4,191 @@ Coturn TURN server Docker image changelog
 
 
 
-## [edge]
-[edge]: /../../tree/master
+## [4.19.1-r0] · 2026-11-16
+[4.19.1-r0]: /../../tree/docker/4.19.1-r0
+
+### Upgraded
+
+- [Coturn] 4.19.1: <https://github.com/coturn/coturn/blob/4.19.1/ChangeLog>
+
+
+
+
+## [4.19.0-r0] · 2026-11-13
+[4.19.0-r0]: /../../tree/docker/4.19.0-r0
+
+### Upgraded
+
+- [Coturn] 4.19.0: <https://github.com/coturn/coturn/blob/4.19.0/ChangeLog>
+
+### Security updated
+
+- [Alpine Linux] 3.24.4: <https://github.com/docker-library/official-images/commit/7d754553c6ddd864e94178a8256f49eea7c02a6d>
+- [Debian Linux] "trixie" 20261104 (13.7): <https://github.com/docker-library/official-images/commit/3877fb0d52982e781d1aab8391e580078656ce28>
+
+
+
+
+## [4.18.0-r0] · 2026-09-08
+[4.18.0-r0]: /../../tree/docker/4.18.0-r0
+
+### Upgraded
+
+- [Coturn] 4.18.0: <https://github.com/coturn/coturn/blob/4.18.0/ChangeLog>
+
+### Security updated
+
+- [Debian Linux] "trixie" 20260824 (13.6): <https://github.com/docker-library/official-images/commit/b9c995a1c91bf8b195b035893ebdf8e877e7f7fa>
+
+
+
+
+## [4.17.2-r0] · 2026-08-10
+[4.17.2-r0]: /../../tree/docker/4.17.2-r0
+
+### Upgraded
+
+- [Coturn] 4.17.2: <https://github.com/coturn/coturn/blob/4.17.2/ChangeLog>
+
+
+
+
+## [4.17.1-r0] · 2026-08-10
+[4.17.1-r0]: /../../tree/docker/4.17.1-r0
+
+### Upgraded
+
+- [Coturn] 4.17.1: <https://github.com/coturn/coturn/blob/4.17.1/ChangeLog>
+
+
+
+
+## [4.17.0-r0] · 2026-08-05
+[4.17.0-r0]: /../../tree/docker/4.17.0-r0
+
+### Upgraded
+
+- [Coturn] 4.17.0: <https://github.com/coturn/coturn/blob/4.17.0/ChangeLog>
+
+### Security updated
+
+- [Debian Linux] "trixie" 20260803 (13.6): <https://github.com/docker-library/official-images/commit/ee0c246fb4f97d25b6cab5455f65da034921bc65>
+
+
+
+
+## [4.16.0-r0] · 2026-07-30
+[4.16.0-r0]: /../../tree/docker/4.16.0-r0
+
+### Upgraded
+
+- [Coturn] 4.16.0: <https://github.com/coturn/coturn/blob/4.16.0/ChangeLog>
+
+
+
+
+## [4.15.0-r0] · 2026-07-22
+[4.15.0-r0]: /../../tree/docker/4.15.0-r0
+
+### Upgraded
+
+- [Coturn] 4.15.0: <https://github.com/coturn/coturn/blob/4.15.0/ChangeLog>
+
+### Security updated
+
+- [Debian Linux] "trixie" 20260713 (13.6): <https://github.com/docker-library/official-images/commit/66ceaa32c0335e6f89173798988f0a395af3b9e2>
+
+
+
+
+## [4.14.0-r0] · 2026-06-22
+[4.14.0-r0]: /../../tree/docker/4.14.0-r0
+
+### Upgraded
+
+- [Coturn] 4.14.0: <https://github.com/coturn/coturn/blob/4.14.0/ChangeLog>
+
+### Security updated
+
+- [Alpine Linux] 3.24.1: <https://github.com/docker-library/official-images/commit/6998e7c6a26f7d35b1aa466283730fc74907d74a>
+
+
+
+
+## [4.13.1-r0] · 2026-06-15
+[4.13.1-r0]: /../../tree/docker/4.13.1-r0
+
+### Upgraded
+
+- [Coturn] 4.13.1: <https://github.com/coturn/coturn/blob/4.13.1/ChangeLog>
+
+
+
+
+## [4.13.0-r0] · 2026-06-15
+[4.13.0-r0]: /../../tree/docker/4.13.0-r0
+
+### Upgraded
+
+- [Coturn] 4.13.0: <https://github.com/coturn/coturn/blob/4.13.0/ChangeLog>
+- [Alpine Linux] 3.24: <https://www.alpinelinux.org/posts/Alpine-3.24.0-released.html>
+
+### Security updated
+
+- [Debian Linux] "trixie" 20260610 (13.5): <https://github.com/docker-library/official-images/commit/62114c9235dd2445347d99b67602d6527fba120b>
+
+
+
+
+## [4.12.0-r0] · 2026-05-25
+[4.12.0-r0]: /../../tree/docker/4.12.0-r0
+
+### Upgraded
+
+- [Coturn] 4.12.0: <https://github.com/coturn/coturn/blob/4.12.0/ChangeLog>
+
+### Security updated
+
+- [Debian Linux] "trixie" 20260518 (13.5): <https://github.com/docker-library/official-images/commit/38cf5c0d614530a50d135669af38aab251ea328a>
+
+
+
+
+## [4.11.0-r0] · 2026-05-09
+[4.11.0-r0]: /../../tree/docker/4.11.0-r0
+
+### Upgraded
+
+- [Coturn] 4.11.0: <https://github.com/coturn/coturn/blob/4.11.0/ChangeLog>
+
+### Security updated
+
+- [Alpine Linux] 3.23.4: <https://github.com/docker-library/official-images/commit/d6df7c9b2a4abb30e768ef983f0f3e123ae63255>
+- [Debian Linux] "trixie" 20260505 (13.4): <https://github.com/docker-library/official-images/commit/a7309f6851272beaab8bfcce6b4561a458f2e6ea>
+
+
+
+
+## [4.10.0-r0] · 2026-04-14
+[4.10.0-r0]: /../../tree/docker/4.10.0-r0
+
+### Upgraded
+
+- [Coturn] 4.10.0: <https://github.com/coturn/coturn/blob/4.10.0/ChangeLog>
+
+### Security updated
+
+- [Debian Linux] "trixie" 20260406 (13.4): <https://github.com/docker-library/official-images/commit/14bc77db7b07b8b0321490adf7e9e152f940f802>
+
+
+
+
+## [4.9.0-r0] · 2026-02-24
+[4.9.0-r0]: /../../tree/docker/4.9.0-r0
+
+### Upgraded
+
+- [Coturn] 4.9.0: <https://github.com/coturn/coturn/blob/4.9.0/ChangeLog>
 
 ### Security updated
 

@@ -33,8 +33,11 @@
  */
 
 #include "mainrelay.h"
+#include <errno.h>
+
 #include "dbdrivers/dbdriver.h"
 
+#include "ns_turn_ratelimit.h"
 #include "prom_server.h"
 #include <assert.h>
 #include <limits.h>
@@ -113,12 +116,8 @@ turn_params_t turn_params = {
 #else
     false,
 #endif
-/*no_dtls*/
-#if !DTLS_SUPPORTED
-    true,
-#else
+    /* dtls: the DTLS listeners are opt-in, enabled with --dtls. */
     false,
-#endif
 
     NULL,      /*tls_ctx_update_ev*/
     {0, NULL}, /*tls_mutex*/
@@ -140,6 +139,7 @@ turn_params_t turn_params = {
     DEFAULT_STUN_TLS_PORT, /* tls_listener_port */
     0,                     /* alt_listener_port */
     0,                     /* alt_tls_listener_port */
+    false,                 /* tls_port_configured */
     0,                     /* tcp_proxy_port */
     false,                 /* rfc5780 */
 
@@ -157,9 +157,6 @@ turn_params_t turn_params = {
     {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, NULL, NULL}, /*listener*/
     {NULL, 0},                                                                /*ip_whitelist*/
     {NULL, 0},                                                                /*ip_blacklist*/
-    NEV_UNKNOWN,                                                              /*net_engine_version*/
-    {"Unknown", "UDP listening socket per session", "UDP thread per network endpoint",
-     "UDP thread per CPU core"}, /*net_engine_version_txt*/
 
     //////////////// Relay servers //////////////////////////////////
     LOW_DEFAULT_PORTS_BOUNDARY,  /*min_port*/
@@ -177,7 +174,7 @@ turn_params_t turn_params = {
 
     NULL,                                 /*external_ip*/
     DEFAULT_GENERAL_RELAY_SERVERS_NUMBER, /*general_relay_servers_number*/
-    0,                                    /*udp_relay_servers_number*/
+    false,                                /*relay_threads_configured*/
     UR_SERVER_SOCK_BUF_SIZE,
 
     ////////////// Auth server /////////////////////////////////////
@@ -192,9 +189,12 @@ turn_params_t turn_params = {
     /////////////// ALTERNATE SERVERS ////////////////
     {NULL, 0, {0, NULL}}, /*alternate_servers_list*/
     {NULL, 0, {0, NULL}}, /*tls_alternate_servers_list*/
+    {NULL, 0, {0, NULL}}, /*tcp_alternate_servers_list*/
+    {NULL, 0, {0, NULL}}, /*udp_alternate_servers_list*/
 
     /////////////// stop server ////////////////
     false, /*drain_turn_server*/
+    0,     /*drain_min_allocations*/
     false, /*stop_turn_server*/
 
     /////////////// MISC PARAMS ////////////////
@@ -221,6 +221,9 @@ turn_params_t turn_params = {
     "",                                 /* prometheus address */
     "/metrics",                         /* prometheus path */
     false, /* prometheus username labelling disabled by default when prometheus is enabled */
+    false, /* prometheus TLS (HTTPS) disabled by default */
+    "",    /* prometheus cert file (defaults to --cert) */
+    "",    /* prometheus key file (defaults to --pkey) */
 
     ///////////// Users DB //////////////
     {(TURN_USERDB_TYPE)0, {"\0", "\0"}, {0, NULL, {NULL, 0}}},
@@ -239,9 +242,32 @@ turn_params_t turn_params = {
 
     false, /* log_binding */
     false, /* stun_backward_compatibility */
+    false, /* rfc5766_channel_numbers */
+    false, /* rfc3489_compatibility */
     false, /* respond_http_unsupported */
-    true,  /* drop_invalid_packets */
-    false  /* drop_invalid_packets_log */
+    false, /* drop_invalid_packets_log */
+#if defined(__linux__)
+    true,  /* udp_recvmmsg (on by default; disable with --udp-recvmmsg=false) */
+    false, /* udp_recvmmsg_log */
+    false, /* udp_sendmmsg (derived from multiplex_peer) */
+    false, /* udp_sendmmsg_log */
+    false, /* udp_gso */
+#endif
+    false, /* include_reason_string */
+    false, /* multiplex_peer */
+    0,     /* multiplex_peer_base_port */
+    0,     /* multiplex_peer_max_peers */
+
+    ///////// Ratelimit /////////
+    TURN_RATELIMIT_OFF,                     /* unauthorized-ratelimit */
+    RATELIMIT_DEFAULT_MAX_REQUESTS_PER_SEC, /* unauthorized-ratelimit-rps */
+
+    ///////// Stateless nonce /////////
+    true,  /* stateless-nonce */
+    {0},   /* stateless_nonce_key (generated at startup when enabled) */
+    false, /* stateless_nonce_key_set */
+
+    false /* oauth_legacy_mac_key */
 };
 
 //////////////// OpenSSL Init //////////////////////
@@ -310,7 +336,7 @@ static int make_local_listeners_list(void) {
 
   do {
 
-    pAddresses = (IP_ADAPTER_ADDRESSES *)malloc(outBufLen);
+    pAddresses = (IP_ADAPTER_ADDRESSES *)turn_malloc(outBufLen);
     if (pAddresses == NULL) {
       TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Memory allocation failed for IP_ADAPTER_ADDRESSES struct\n");
       return -1;
@@ -584,7 +610,7 @@ static int make_local_relays_list(int allow_local, int family) {
 
   do {
 
-    pAddresses = (IP_ADAPTER_ADDRESSES *)malloc(outBufLen);
+    pAddresses = (IP_ADAPTER_ADDRESSES *)turn_malloc(outBufLen);
     if (pAddresses == NULL) {
       TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Memory allocation failed for IP_ADAPTER_ADDRESSES struct\n");
       return -1;
@@ -769,7 +795,7 @@ int get_a_local_relay(int family, ioa_addr *relay_addr) {
   outBufLen = WORKING_BUFFER_SIZE;
 
   do {
-    pAddresses = (IP_ADAPTER_ADDRESSES *)malloc(outBufLen);
+    pAddresses = (IP_ADAPTER_ADDRESSES *)turn_malloc(outBufLen);
     if (pAddresses == NULL) {
       TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Memory allocation failed for IP_ADAPTER_ADDRESSES struct\n");
       return -1;
@@ -1005,8 +1031,10 @@ static char Usage[] =
     "behind NAT.\n"
     "						In that situation, if a -X is used in form \"-X ip\" then that ip will "
     "be reported\n"
-    "						as relay IP address of all allocations. This scenario works only in a "
-    "simple case\n"
+    "						as relay IP address of all allocations of its own address family (a "
+    "relay of the\n"
+    "						other family is reported under its own address). This scenario works "
+    "only in a simple case\n"
     "						when one single relay address is be used, and no STUN CHANGE_REQUEST\n"
     "						functionality is required.\n"
     "						That single relay address must be mapped by NAT to the 'external' IP.\n"
@@ -1158,6 +1186,12 @@ static char Usage[] =
     " --prometheus-address		<address>		Prometheus listening address (Default: any).\n"
     " --prometheus-path		<path>		Prometheus serve path (Default: /metrics).\n"
     " --prometheus-username-labels			When metrics are enabled, add labels with client usernames.\n"
+    " --prometheus-tls				Serve the metrics endpoint over HTTPS instead of HTTP "
+    "(optional). Implies --prometheus. Requires libmicrohttpd built with TLS support.\n"
+    " --prometheus-cert		<file>		PEM certificate for the HTTPS metrics endpoint "
+    "(Default: the server's --cert).\n"
+    " --prometheus-key		<file>		PEM private key for the HTTPS metrics endpoint "
+    "(Default: the server's --pkey).\n"
 #endif
     " --use-auth-secret				TURN REST API flag.\n"
     "						Flag that sets a special authorization option that is based upon "
@@ -1180,15 +1214,22 @@ static char Usage[] =
     "						the oAuth authentication purposes.\n"
     "						The default value is the realm name.\n"
     " --oauth					Support oAuth authentication.\n"
+    " --oauth-legacy-mac-key			Compute oAuth MESSAGE-INTEGRITY with only the first 16 bytes of\n"
+    "						the token's 20-byte mac_key, as coturn did before; RFC 7635\n"
+    "						requires the whole key. Only for clients or authorization servers\n"
+    "						that depend on the old behavior. Off by default.\n"
     " -n						Do not use configuration file, take all parameters from the "
     "command line only.\n"
     " --cert			<filename>		Certificate file, PEM format. Same file search rules\n"
     "						applied as for the configuration file.\n"
-    "						If both --no-tls and --no_dtls options\n"
-    "						are specified, then this parameter is not needed.\n"
+    "						If --no-tls is specified and --dtls is not,\n"
+    "						then this parameter is not needed.\n"
+    " --raw-public-keys[=<value>]			Enable raw public keys support (RFC 7250). Off by default;\n"
+    "						requires OpenSSL 3.2.1 or later.\n"
     " --pkey			<filename>		Private key file, PEM format. Same file search rules\n"
     "						applied as for the configuration file.\n"
-    "						If both --no-tls and --no-dtls options\n"
+    "						If --no-tls is specified and --dtls is not,\n"
+    "						then this parameter is not needed.\n"
     " --pkey-pwd		<password>		If the private key file is encrypted, then this password to be "
     "used.\n"
     " --cipher-list		<cipher-string>		Allowed OpenSSL cipher list for TLS/DTLS connections.\n"
@@ -1219,7 +1260,7 @@ static char Usage[] =
     " --no-udp					Do not start UDP client listeners.\n"
     " --no-tcp					Do not start TCP client listeners.\n"
     " --no-tls					Do not start TLS client listeners.\n"
-    " --no-dtls					Do not start DTLS client listeners.\n"
+    " --dtls					Start DTLS client listeners. DTLS is not started by default.\n"
     " --no-udp-relay					Do not allow UDP relay endpoints, use only TCP relay option.\n"
     " --no-tcp-relay					Do not allow TCP relay endpoints, use only UDP relay options.\n"
     " -l, --log-file		<filename>		Option to set the full path name of the log file.\n"
@@ -1245,9 +1286,17 @@ static char Usage[] =
     "						name will be constructed as-is, without PID and date appendage.\n"
     "						This option can be used, for example, together with the logrotate "
     "tool.\n"
-    " --new-log-timestamp				Enable full ISO-8601 timestamp in all logs.\n"
+    " --log-min-level	<level>			Only emit log messages at or above this level: debug, info, "
+    "warning,\n"
+    "						or error. Default is debug (everything). An unrecognized level is\n"
+    "						ignored with a warning.\n"
+    " --new-log-timestamp[=<value>]		Use a full ISO-8601 timestamp in all logs. Enabled by default;\n"
+    "						pass --new-log-timestamp=false for the legacy counter of\n"
+    "						seconds since start.\n"
     " --new-log-timestamp-format    	<format>	Set timestamp format (in strftime(1) format). Depends on "
     "--new-log-timestamp to be enabled.\n"
+    "						Besides the strftime(1) conversions, %f expands to "
+    "milliseconds.\n"
     " --log-binding					Log STUN binding request. It is now disabled by default to "
     "avoid DoS attacks.\n"
     " --stale-nonce[=<value>]			Use extra security with nonce value having limited lifetime (default "
@@ -1273,11 +1322,32 @@ static char Usage[] =
     "						Multiple alternate-server options can be set for load balancing "
     "purposes.\n"
     "						See the docs for more information.\n"
+    " --udp-alternate-server	<ip:port>		Set the TURN server to redirect the allocate requests (UDP "
+    "and DTLS services).\n"
+    "						Takes precedence over --alternate-server and --udp-self-balance "
+    "for UDP/DTLS clients.\n"
+    "						Multiple alternate-server options can be set for load balancing "
+    "purposes.\n"
+    "						See the docs for more information.\n"
+    " --tcp-alternate-server	<ip:port>		Set the TURN server to redirect the allocate requests (TCP "
+    "service).\n"
+    "						Takes precedence over --alternate-server for TCP clients.\n"
+    "						Multiple alternate-server options can be set for load balancing "
+    "purposes.\n"
+    "						See the docs for more information.\n"
     " -C, --rest-api-separator	<SYMBOL>	This is the timestamp/username separator symbol (character) in TURN "
     "REST API.\n"
     "						The default value is ':'.\n"
     " --max-allocate-timeout=<seconds>		Max time, in seconds, allowed for full allocation establishment. "
     "Default is 60.\n"
+    " --dtls-half-open-timeout=<seconds>	Max time, in seconds, for a DTLS handshake to finish before the "
+    "session is reaped.\n"
+    "						Default is 10. After the handshake completes, --max-allocate-timeout "
+    "applies.\n"
+    " --drain-min-allocations=<number>		In drain mode (SIGUSR1), shut down once the number of active "
+    "allocations\n"
+    "						drops to this value or below. Default is 0 (wait until all "
+    "allocations are gone).\n"
     " --allowed-peer-ip=<ip[-ip]> 			Specifies an ip or range of ips that are explicitly allowed to "
     "connect to the \n"
     "						turn server. Multiple allowed-peer-ip can be set.\n"
@@ -1312,7 +1382,7 @@ static char Usage[] =
     "						The standard RFC explicitly define actually that this default must be "
     "IPv4,\n"
     "						so use other option values with care!\n"
-    " --no-cli					Turn OFF the CLI support. By default it is always ON.\n"
+    " --cli					Turn ON the CLI support. By default it is always OFF.\n"
     " --cli-ip=<IP>					Local system IP address to be used for CLI server endpoint. "
     "Default value\n"
     "						is 127.0.0.1.\n"
@@ -1339,8 +1409,6 @@ static char Usage[] =
     " --cli-max-output-sessions			Maximum number of output sessions in ps CLI command.\n"
     "						This value can be changed on-the-fly in CLI. The default value is "
     "256.\n"
-    " --ne=[1|2|3]					Set network engine type for the process (for internal "
-    "purposes).\n"
     " --no-rfc5780					DEPRECATED and now default, see --rfc5780.\n"
     " --rfc5780					Enable RFC5780 (NAT behavior discovery).\n"
     "						Originally, if there are more than one listener address from the same\n"
@@ -1353,16 +1421,91 @@ static char Usage[] =
     "amplification attack.)\n"
     "						Strongly encouraged to keep it off to decrease gain factor in STUN "
     "binding responses.\n"
-    " --stun-backward-compatibility		        Enable handling old STUN Binding requests and enable "
-    "MAPPED-ADDRESS attribute\n"
+    " --stun-backward-compatibility		        Add the deprecated MAPPED-ADDRESS attribute to STUN Binding\n"
+    "						responses, alongside XOR-MAPPED-ADDRESS, for clients that cannot "
+    "parse\n"
+    "						the latter. Strongly encouraged to keep it off to decrease gain factor "
+    "in\n"
+    "						STUN binding responses.\n"
+    " --rfc3489-compatibility			DEPRECATED. Enable handling of obsolete RFC 3489 (\"classic\" "
+    "STUN)\n"
+    "						Binding requests, which carry no magic cookie. Scheduled for removal "
+    "in\n"
+    "						the next major release; there is no replacement.\n"
+    " --rfc5766-channel-numbers			Accept ChannelBind channel numbers from the obsolete RFC 5766 "
+    "range 0x5000-0x7FFF,\n"
+    "						which RFC 8656 reserves for multiplexing collision avoidance "
+    "(RFC 7983). Only for\n"
+    "						compatibility with legacy clients; ChannelData on those "
+    "channels may be dropped by\n"
+    "						conformant demultiplexing endpoints.\n"
     " --respond-http-unsupported			Return an HTTP reponse with a 400 status code to HTTP "
     "connections made to ports not\n"
     "						supporting HTTP. The default behaviour is to immediately "
     "close the connection.\n"
-    " --drop-invalid-packets			   Drop invalid packets early. The default behaviour is to accept all "
-    "packets.\n"
     " --drop-invalid-packets-log			   Log invalid packets. The default behaviour is to not log "
     "invalid packets.\n"
+#if defined(__linux__)
+    " --udp-recvmmsg				   Linux-only batched UDP receive via recvmmsg() on the "
+    "shared fan-in sockets (the client listener and, when --multiplex-peer is set, the per-thread relay socket). "
+    "Enabled by default; disable with --udp-recvmmsg=false. Independent of --multiplex-peer and worth keeping on for "
+    "high client concurrency. Per-session relay sockets are left on the single-recv path, where batching would only "
+    "add buffer churn.\n"
+    " --udp-recvmmsg-log			   Log Linux recvmmsg batch occupancy stats every 10 seconds.\n"
+    " --udp-sendmmsg-log			   Log Linux sendmmsg/UDP-GSO egress batch occupancy and "
+    "GSO-engagement "
+    "stats every 10 seconds. Only meaningful with --multiplex-peer (which enables sendmmsg batching).\n"
+    " --udp-gso				   Enable Linux UDP-GSO (UDP_SEGMENT cmsg) when a sendmmsg batch shares "
+    "destination and size; collapses N datagrams into one network-stack traversal. Requires "
+    "--multiplex-peer (which enables sendmmsg batching).\n"
+#endif
+    " --multiplex-peer\n"
+    "        Enable peer-side multiplexing relay mode (non-standard, optional).\n"
+    "        Each relay thread opens one UDP socket pair (IPv4+IPv6) shared\n"
+    "        across all TURN sessions on that thread. Sessions are demultiplexed\n"
+    "        by exact peer IP:port lookup. Port layout (B=--multiplex-peer-port):\n"
+    "          thread 0: IPv4=B+0, IPv6=B+1\n"
+    "          thread 1: IPv4=B+2, IPv6=B+3  ...\n"
+    "        Eliminates port-range exhaustion. Incompatible with EVEN-PORT.\n"
+    "        Implies sendmmsg batching on Linux. --udp-recvmmsg (on by default)\n"
+    "        provides the recvmmsg window the batching piggybacks on.\n"
+    " --multiplex-peer-port <port>\n"
+    "        Base UDP port for multiplex-peer relay sockets. Default: 3480.\n"
+    "        Total ports consumed = relay_threads * 2.\n"
+    " --multiplex-peer-max-peers <number>\n"
+    "        Maximum distinct peer IP:port endpoints one allocation may keep in\n"
+    "        the shared demux table. Further endpoints are refused with 508.\n"
+    "        Default: 256. Only meaningful with --multiplex-peer.\n"
+    " --include-reason-string			   Include descriptive reason strings in STUN/TURN error responses.\n"
+    "						   By default, only the standard reason phrase for the error code is\n"
+    "						   sent. Enabling this option adds detailed error descriptions which\n"
+    "						   may aid debugging but can also leak internal server information.\n"
+    " --unauthorized-ratelimit[=<mode>]              Enable per-source rate-limiting of 401\n"
+    "                                                 Unauthorized responses on UDP. Mitigates\n"
+    "                                                 reflection/amplification abuse where attackers\n"
+    "                                                 spoof a victim's source address to bounce 401\n"
+    "                                                 challenges off the server. Off by default.\n"
+    "                                                 <mode> is enforce (the default when given\n"
+    "                                                 without a value, same as on/yes/true), observe\n"
+    "                                                 (count and log what would be suppressed but\n"
+    "                                                 still respond), or off.\n"
+    " --unauthorized-ratelimit-rps=<count>           Max 401 Unauthorized responses to send per\n"
+    "                                                 source IP per second (default 10).\n"
+    " --stateless-nonce                              Issue 401/438 challenge nonces as authenticated\n"
+    "                                                 timestamp cookies (issue time + HMAC over the\n"
+    "                                                 client address, keyed by a per-process secret)\n"
+    "                                                 instead of storing a random nonce in the\n"
+    "                                                 session. Unauthenticated UDP requests are then\n"
+    "                                                 answered without allocating per-client session\n"
+    "                                                 state, bounding memory under spoofed-source floods\n"
+    "                                                 of structurally valid STUN messages. On by default;\n"
+    "                                                 disable with --stateless-nonce=false.\n"
+    " --stateless-nonce-secret=<secret>              Derive the stateless-nonce signing key from this\n"
+    "                                                 secret instead of a random per-process key, so\n"
+    "                                                 servers sharing the secret (and NTP-synced clocks)\n"
+    "                                                 validate each other's nonces across restarts and\n"
+    "                                                 load-balanced fleets. Use a high-entropy string.\n"
+    "                                                 Implies --stateless-nonce.\n"
     " --version					Print version (and exit).\n"
     " -h						Help\n"
     "\n";
@@ -1436,7 +1579,7 @@ enum EXTRA_OPTS {
   NO_TCP_OPT,
   TCP_PROXY_PORT_OPT,
   NO_TLS_OPT,
-  NO_DTLS_OPT,
+  DTLS_OPT,
   NO_UDP_RELAY_OPT,
   NO_TCP_RELAY_OPT,
   TLS_PORT_OPT,
@@ -1458,6 +1601,9 @@ enum EXTRA_OPTS {
   PROMETHEUS_ADDRESS_OPT,
   PROMETHEUS_PATH_OPT,
   PROMETHEUS_ENABLE_USERNAMES_OPT,
+  PROMETHEUS_TLS_OPT,
+  PROMETHEUS_CERT_OPT,
+  PROMETHEUS_KEY_OPT,
   AUTH_SECRET_OPT,
   NO_AUTH_PINGS_OPT,
   NO_DYNAMIC_IP_LIST_OPT,
@@ -1468,15 +1614,19 @@ enum EXTRA_OPTS {
   SYSLOG_OPT,
   SYSLOG_FACILITY_OPT,
   SIMPLE_LOG_OPT,
+  LOG_MIN_LEVEL_OPT,
   NEW_LOG_TIMESTAMP_OPT,
   NEW_LOG_TIMESTAMP_FORMAT_OPT,
   AUX_SERVER_OPT,
   UDP_SELF_BALANCE_OPT,
   ALTERNATE_SERVER_OPT,
   TLS_ALTERNATE_SERVER_OPT,
+  TCP_ALTERNATE_SERVER_OPT,
+  UDP_ALTERNATE_SERVER_OPT,
   NO_MULTICAST_PEERS_OPT,
   ALLOW_LOOPBACK_PEERS_OPT,
   MAX_ALLOCATE_TIMEOUT_OPT,
+  DTLS_HALF_OPEN_TIMEOUT_OPT,
   ALLOWED_PEER_IPS,
   DENIED_PEER_IPS,
   CIPHER_LIST_OPT,
@@ -1489,6 +1639,7 @@ enum EXTRA_OPTS {
   PROC_GROUP_OPT,
   MOBILITY_OPT,
   NO_CLI_OPT,
+  CLI_OPT,
   CLI_IP_OPT,
   CLI_PORT_OPT,
   CLI_PASSWORD_OPT,
@@ -1501,7 +1652,6 @@ enum EXTRA_OPTS {
   EC_CURVE_NAME_OPT,
   DH566_OPT,
   DH1066_OPT,
-  NE_TYPE_OPT,
   ENABLE_TLSV1_OPT,
   ENABLE_TLSV1_1_OPT,
   NO_TLSV1_2_OPT,
@@ -1520,12 +1670,29 @@ enum EXTRA_OPTS {
   NO_RFC5780,
   ENABLE_RFC5780,
   STUN_BACKWARD_COMPATIBILITY_OPT,
+  RFC5766_CHANNEL_NUMBERS_OPT,
+  RFC3489_COMPATIBILITY_OPT,
   RESPONSE_ORIGIN_ONLY_WITH_RFC5780_OPT,
   RESPOND_HTTP_UNSUPPORTED_OPT,
-  DROP_INVALID_PACKETS_OPT,
   DROP_INVALID_PACKETS_LOG_OPT,
+#if defined(__linux__)
+  UDP_RECVMMSG_OPT,
+  UDP_RECVMMSG_LOG_OPT,
+  UDP_SENDMMSG_LOG_OPT,
+  UDP_GSO_OPT,
+#endif
   VERSION_OPT,
-  CPUS_OPT
+  DRAIN_MIN_ALLOCATIONS_OPT,
+  RATELIMIT_OPT,
+  RATELIMIT_RPS_OPT,
+  STATELESS_NONCE_OPT,
+  STATELESS_NONCE_SECRET_OPT,
+  CPUS_OPT,
+  INCLUDE_REASON_STRING_OPT,
+  OAUTH_LEGACY_MAC_KEY_OPT,
+  OPT_MULTIPLEX_PEER = 800,
+  OPT_MULTIPLEX_PEER_PORT = 801,
+  OPT_MULTIPLEX_PEER_MAX_PEERS = 802
 };
 
 struct myoption {
@@ -1579,10 +1746,13 @@ static const struct myoption long_options[] = {
 #endif
 #if !defined(TURN_NO_PROMETHEUS)
     {"prometheus", optional_argument, NULL, PROMETHEUS_OPT},
-    {"prometheus-port", optional_argument, NULL, PROMETHEUS_PORT_OPT},
-    {"prometheus-address", optional_argument, NULL, PROMETHEUS_ADDRESS_OPT},
-    {"prometheus-path", optional_argument, NULL, PROMETHEUS_PATH_OPT},
+    {"prometheus-port", required_argument, NULL, PROMETHEUS_PORT_OPT},
+    {"prometheus-address", required_argument, NULL, PROMETHEUS_ADDRESS_OPT},
+    {"prometheus-path", required_argument, NULL, PROMETHEUS_PATH_OPT},
     {"prometheus-username-labels", optional_argument, NULL, PROMETHEUS_ENABLE_USERNAMES_OPT},
+    {"prometheus-tls", optional_argument, NULL, PROMETHEUS_TLS_OPT},
+    {"prometheus-cert", required_argument, NULL, PROMETHEUS_CERT_OPT},
+    {"prometheus-key", required_argument, NULL, PROMETHEUS_KEY_OPT},
 #endif
     {"use-auth-secret", optional_argument, NULL, AUTH_SECRET_OPT},
     {"static-auth-secret", required_argument, NULL, STATIC_AUTH_SECRET_VAL_OPT},
@@ -1592,6 +1762,7 @@ static const struct myoption long_options[] = {
     {"realm", required_argument, NULL, 'r'},
     {"server-name", required_argument, NULL, SERVER_NAME_OPT},
     {"oauth", optional_argument, NULL, OAUTH_OPT},
+    {"oauth-legacy-mac-key", optional_argument, NULL, OAUTH_LEGACY_MAC_KEY_OPT},
     {"user-quota", required_argument, NULL, 'q'},
     {"total-quota", required_argument, NULL, 'Q'},
     {"max-bps", required_argument, NULL, 's'},
@@ -1606,7 +1777,7 @@ static const struct myoption long_options[] = {
     {"no-udp", optional_argument, NULL, NO_UDP_OPT},
     {"no-tcp", optional_argument, NULL, NO_TCP_OPT},
     {"no-tls", optional_argument, NULL, NO_TLS_OPT},
-    {"no-dtls", optional_argument, NULL, NO_DTLS_OPT},
+    {"dtls", optional_argument, NULL, DTLS_OPT},
     {"no-udp-relay", optional_argument, NULL, NO_UDP_RELAY_OPT},
     {"no-tcp-relay", optional_argument, NULL, NO_TCP_RELAY_OPT},
     {"stale-nonce", optional_argument, NULL, STALE_NONCE_OPT},
@@ -1623,14 +1794,19 @@ static const struct myoption long_options[] = {
     {"no-stdout-log", optional_argument, NULL, NO_STDOUT_LOG_OPT},
     {"syslog", optional_argument, NULL, SYSLOG_OPT},
     {"simple-log", optional_argument, NULL, SIMPLE_LOG_OPT},
+    {"log-min-level", required_argument, NULL, LOG_MIN_LEVEL_OPT},
     {"new-log-timestamp", optional_argument, NULL, NEW_LOG_TIMESTAMP_OPT},
     {"new-log-timestamp-format", required_argument, NULL, NEW_LOG_TIMESTAMP_FORMAT_OPT},
     {"aux-server", required_argument, NULL, AUX_SERVER_OPT},
     {"udp-self-balance", optional_argument, NULL, UDP_SELF_BALANCE_OPT},
     {"alternate-server", required_argument, NULL, ALTERNATE_SERVER_OPT},
     {"tls-alternate-server", required_argument, NULL, TLS_ALTERNATE_SERVER_OPT},
+    {"tcp-alternate-server", required_argument, NULL, TCP_ALTERNATE_SERVER_OPT},
+    {"udp-alternate-server", required_argument, NULL, UDP_ALTERNATE_SERVER_OPT},
     {"rest-api-separator", required_argument, NULL, 'C'},
     {"max-allocate-timeout", required_argument, NULL, MAX_ALLOCATE_TIMEOUT_OPT},
+    {"dtls-half-open-timeout", required_argument, NULL, DTLS_HALF_OPEN_TIMEOUT_OPT},
+    {"drain-min-allocations", required_argument, NULL, DRAIN_MIN_ALLOCATIONS_OPT},
     {"no-multicast-peers", optional_argument, NULL, NO_MULTICAST_PEERS_OPT},
     {"allow-loopback-peers", optional_argument, NULL, ALLOW_LOOPBACK_PEERS_OPT},
     {"allowed-peer-ip", required_argument, NULL, ALLOWED_PEER_IPS},
@@ -1644,6 +1820,7 @@ static const struct myoption long_options[] = {
     {"proc-group", required_argument, NULL, PROC_GROUP_OPT},
     {"mobility", optional_argument, NULL, MOBILITY_OPT},
     {"no-cli", optional_argument, NULL, NO_CLI_OPT},
+    {"cli", optional_argument, NULL, CLI_OPT},
     {"cli-ip", required_argument, NULL, CLI_IP_OPT},
     {"cli-port", required_argument, NULL, CLI_PORT_OPT},
     {"cli-password", required_argument, NULL, CLI_PASSWORD_OPT},
@@ -1656,7 +1833,6 @@ static const struct myoption long_options[] = {
     {"ec-curve-name", required_argument, NULL, EC_CURVE_NAME_OPT},
     {"dh566", optional_argument, NULL, DH566_OPT},
     {"dh1066", optional_argument, NULL, DH1066_OPT},
-    {"ne", required_argument, NULL, NE_TYPE_OPT},
     {"tlsv1", optional_argument, NULL, ENABLE_TLSV1_OPT},
     {"tlsv1_1", optional_argument, NULL, ENABLE_TLSV1_1_OPT},
     {"no-tlsv1_2", optional_argument, NULL, NO_TLSV1_2_OPT},
@@ -1668,13 +1844,28 @@ static const struct myoption long_options[] = {
     {"no-rfc5780", optional_argument, NULL, NO_RFC5780},
     {"rfc5780", optional_argument, NULL, ENABLE_RFC5780},
     {"stun-backward-compatibility", optional_argument, NULL, STUN_BACKWARD_COMPATIBILITY_OPT},
+    {"rfc5766-channel-numbers", optional_argument, NULL, RFC5766_CHANNEL_NUMBERS_OPT},
+    {"rfc3489-compatibility", optional_argument, NULL, RFC3489_COMPATIBILITY_OPT},
     {"response-origin-only-with-rfc5780", optional_argument, NULL, RESPONSE_ORIGIN_ONLY_WITH_RFC5780_OPT},
     {"respond-http-unsupported", optional_argument, NULL, RESPOND_HTTP_UNSUPPORTED_OPT},
-    {"drop-invalid-packets", optional_argument, NULL, DROP_INVALID_PACKETS_OPT},
     {"drop-invalid-packets-log", optional_argument, NULL, DROP_INVALID_PACKETS_LOG_OPT},
+#if defined(__linux__)
+    {"udp-recvmmsg", optional_argument, NULL, UDP_RECVMMSG_OPT},
+    {"udp-recvmmsg-log", optional_argument, NULL, UDP_RECVMMSG_LOG_OPT},
+    {"udp-sendmmsg-log", optional_argument, NULL, UDP_SENDMMSG_LOG_OPT},
+    {"udp-gso", optional_argument, NULL, UDP_GSO_OPT},
+#endif
+    {"include-reason-string", optional_argument, NULL, INCLUDE_REASON_STRING_OPT},
+    {"multiplex-peer", no_argument, NULL, OPT_MULTIPLEX_PEER},
+    {"multiplex-peer-port", required_argument, NULL, OPT_MULTIPLEX_PEER_PORT},
+    {"multiplex-peer-max-peers", required_argument, NULL, OPT_MULTIPLEX_PEER_MAX_PEERS},
     {"version", optional_argument, NULL, VERSION_OPT},
     {"syslog-facility", required_argument, NULL, SYSLOG_FACILITY_OPT},
     {"cpus", required_argument, NULL, CPUS_OPT},
+    {"unauthorized-ratelimit", optional_argument, NULL, RATELIMIT_OPT},
+    {"unauthorized-ratelimit-rps", optional_argument, NULL, RATELIMIT_RPS_OPT},
+    {"stateless-nonce", optional_argument, NULL, STATELESS_NONCE_OPT},
+    {"stateless-nonce-secret", required_argument, NULL, STATELESS_NONCE_SECRET_OPT},
     {NULL, no_argument, NULL, 0}};
 
 static const struct myoption admin_long_options[] = {
@@ -1754,21 +1945,46 @@ void encrypt_aes_128(unsigned char *in, const unsigned char *mykey) {
 
   int j = 0, k = 0;
   int totalSize = 0;
-  AES_KEY key;
-  unsigned char iv[8] = {0}; // changed
-  unsigned char out[1024];   // changed
-  AES_set_encrypt_key(mykey, 128, &key);
-  char total[256];
-  int size = 0;
-  struct ctr_state state;
-  init_ctr(&state, iv);
+  unsigned char iv[16] = {0}; // 16-byte IV for AES-CTR (expanded from 8 bytes)
+  unsigned char out[1024];    // changed
+  char total[1024];
+  int outlen = 0;
 
-  CRYPTO_ctr128_encrypt(in, out, strlen((char *)in), &key, state.ivec, state.ecount, &state.num,
-                        (block128_f)AES_encrypt);
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) {
+    return;
+  }
 
-  totalSize += strlen((char *)in);
-  size = strlen((char *)in);
-  for (j = 0; j < size; j++) {
+  // Initialize encryption with AES-128-CTR
+  if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), NULL, mykey, iv) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return;
+  }
+
+  // Disable padding for CTR mode
+  EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+  int inlen = (int)strlen((char *)in);
+  if (inlen > (int)sizeof(out)) {
+    inlen = (int)sizeof(out);
+  }
+
+  // Perform encryption
+  if (EVP_EncryptUpdate(ctx, out, &outlen, in, inlen) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return;
+  }
+
+  int final_len = 0;
+  if (EVP_EncryptFinal_ex(ctx, out + outlen, &final_len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return;
+  }
+
+  EVP_CIPHER_CTX_free(ctx);
+
+  totalSize = outlen + final_len;
+  for (j = 0; j < totalSize; j++) {
     total[k++] = out[j];
   }
 
@@ -1812,13 +2028,13 @@ static void generate_aes_128_key(char *filePath, unsigned char *returnedKey) {
 unsigned char *base64decode(const void *b64_decode_this, int decode_this_many_bytes) {
   BIO *b64_bio, *mem_bio; // Declares two OpenSSL BIOs: a base64 filter and a memory BIO.
   unsigned char *base64_decoded =
-      (unsigned char *)calloc((decode_this_many_bytes * 3) / 4 + 1, sizeof(char)); //+1 = null.
-  b64_bio = BIO_new(BIO_f_base64());                                               // Initialize our base64 filter BIO.
-  mem_bio = BIO_new(BIO_s_mem());                                                  // Initialize our memory source BIO.
-  BIO_write(mem_bio, b64_decode_this, decode_this_many_bytes);                     // Base64 data saved in source.
-  BIO_push(b64_bio, mem_bio);                     // Link the BIOs by creating a filter-source BIO chain.
-  BIO_set_flags(b64_bio, BIO_FLAGS_BASE64_NO_NL); // Don't require trailing newlines.
-  int decoded_byte_index = 0;                     // Index where the next base64_decoded byte should be written.
+      (unsigned char *)turn_calloc((decode_this_many_bytes * 3) / 4 + 1, sizeof(char)); //+1 = null.
+  b64_bio = BIO_new(BIO_f_base64());                           // Initialize our base64 filter BIO.
+  mem_bio = BIO_new(BIO_s_mem());                              // Initialize our memory source BIO.
+  BIO_write(mem_bio, b64_decode_this, decode_this_many_bytes); // Base64 data saved in source.
+  BIO_push(b64_bio, mem_bio);                                  // Link the BIOs by creating a filter-source BIO chain.
+  BIO_set_flags(b64_bio, BIO_FLAGS_BASE64_NO_NL);              // Don't require trailing newlines.
+  int decoded_byte_index = 0; // Index where the next base64_decoded byte should be written.
   while (0 < BIO_read(b64_bio, base64_decoded + decoded_byte_index, 1)) { // Read byte-by-byte.
     decoded_byte_index++; // Increment the index until read of BIO decoded data is complete.
   }                       // Once we're done reading decoded data, BIO_read returns -1 even though there's no error.
@@ -1841,22 +2057,51 @@ int decodedTextSize(char *input) {
 }
 
 void decrypt_aes_128(char *in, const unsigned char *mykey) {
-  unsigned char iv[8] = {0};
-  AES_KEY key;
-  unsigned char outdata[256] = {0};
-  AES_set_encrypt_key(mykey, 128, &key);
-  const int newTotalSize = decodedTextSize(in);
+  unsigned char iv[16] = {0}; // 16-byte IV for AES-CTR (expanded from 8 bytes)
+  int newTotalSize = decodedTextSize(in);
   const int bytes_to_decode = strlen(in);
   unsigned char *encryptedText = base64decode(in, bytes_to_decode);
   char last[1024] = "";
-  struct ctr_state state;
-  init_ctr(&state, iv);
+  int outlen = 0;
 
-  CRYPTO_ctr128_encrypt(encryptedText, outdata, newTotalSize, &key, state.ivec, state.ecount, &state.num,
-                        (block128_f)AES_encrypt);
+  // Bounds check to prevent buffer overflow
+  if (newTotalSize > (int)(sizeof(last) - 1)) {
+    newTotalSize = sizeof(last) - 1;
+  }
 
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) {
+    free(encryptedText);
+    return;
+  }
+
+  // Initialize decryption with AES-128-CTR (CTR mode: encryption = decryption)
+  if (EVP_DecryptInit_ex(ctx, EVP_aes_128_ctr(), NULL, mykey, iv) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    free(encryptedText);
+    return;
+  }
+
+  // Disable padding for CTR mode
+  EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+  // Perform decryption directly into last buffer
+  if (EVP_DecryptUpdate(ctx, (unsigned char *)last, &outlen, encryptedText, newTotalSize) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    free(encryptedText);
+    return;
+  }
+
+  int final_len = 0;
+  if (EVP_DecryptFinal_ex(ctx, (unsigned char *)last + outlen, &final_len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    free(encryptedText);
+    return;
+  }
+
+  EVP_CIPHER_CTX_free(ctx);
   free(encryptedText);
-  strcat(last, (char *)outdata);
+  last[outlen + final_len] = '\0';
   printf("%s\n", last);
 }
 
@@ -1865,6 +2110,24 @@ static int get_int_value(const char *s, int default_value) {
     return default_value;
   }
   return atoi(s);
+}
+
+/* Parse a TCP/UDP port from a config/CLI value with range validation.
+ * Accepts 0 (meaning OS-assigned/disabled, depending on the option) through
+ * 65535. Rejects non-numeric, negative, and out-of-range values rather than
+ * silently truncating them into a uint16_t (e.g. 65536 -> 0). */
+static uint16_t get_port_value(const char *s) {
+  if (!s || !(s[0])) {
+    return 0;
+  }
+  char *endptr = NULL;
+  errno = 0;
+  const long parsed = strtol(s, &endptr, 10);
+  if (errno != 0 || endptr == s || (endptr && *endptr != '\0') || parsed < 0 || parsed > 65535) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Invalid port value: %s (must be 0-65535)\n", s);
+    exit(-1);
+  }
+  return (uint16_t)parsed;
 }
 
 static int get_bool_value(const char *s) {
@@ -1933,6 +2196,9 @@ static void set_option(int c, char *value) {
       turn_params.oauth = get_bool_value(value);
     }
     break;
+  case OAUTH_LEGACY_MAC_KEY_OPT:
+    turn_params.oauth_legacy_mac_key = get_bool_value(value);
+    break;
   case ENABLE_TLSV1_OPT:
     turn_params.enable_tlsv1 = get_bool_value(value);
     break;
@@ -1942,13 +2208,6 @@ static void set_option(int c, char *value) {
   case NO_TLSV1_2_OPT:
     turn_params.no_tlsv1_2 = get_bool_value(value);
     break;
-  case NE_TYPE_OPT: {
-    const int ne = atoi(value);
-    if ((ne < (int)NEV_MIN) || (ne > (int)NEV_MAX)) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "ERROR: wrong version of the network engine: %d\n", ne);
-    }
-    turn_params.net_engine_version = (NET_ENG_VERSION)ne;
-  } break;
   case DH566_OPT:
     if (get_bool_value(value)) {
       turn_params.dh_key_size = DH_566;
@@ -1972,7 +2231,10 @@ static void set_option(int c, char *value) {
     turn_params.mobility = get_bool_value(value);
     break;
   case NO_CLI_OPT:
-    use_cli = !get_bool_value(value);
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "no-cli option is deprecated, see --cli\n");
+    break;
+  case CLI_OPT:
+    use_cli = get_bool_value(value);
     break;
   case CLI_IP_OPT:
     if (make_ioa_addr((const uint8_t *)value, 0, &cli_addr) < 0) {
@@ -1982,7 +2244,7 @@ static void set_option(int c, char *value) {
     }
     break;
   case CLI_PORT_OPT:
-    cli_port = atoi(value);
+    cli_port = get_port_value(value);
     break;
   case CLI_PASSWORD_OPT:
     STRCPY(cli_password, value);
@@ -1998,7 +2260,7 @@ static void set_option(int c, char *value) {
     }
     break;
   case WEB_ADMIN_PORT_OPT:
-    web_admin_port = atoi(value);
+    web_admin_port = get_port_value(value);
     break;
   case WEB_ADMIN_LISTEN_ON_WORKERS_OPT:
     turn_params.web_admin_listen_on_workers = get_bool_value(value);
@@ -2033,6 +2295,7 @@ static void set_option(int c, char *value) {
     STRCPY(turn_params.relay_ifname, value);
     break;
   case 'm':
+    turn_params.relay_threads_configured = true;
     if (atoi(value) > MAX_NUMBER_OF_GENERAL_RELAY_SERVERS) {
       TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "WARNING: max number of relay threads is 128.\n");
       turn_params.general_relay_servers_number = MAX_NUMBER_OF_GENERAL_RELAY_SERVERS;
@@ -2046,26 +2309,28 @@ static void set_option(int c, char *value) {
     STRCPY(turn_params.listener_ifname, value);
     break;
   case 'p':
-    turn_params.listener_port = atoi(value);
+    turn_params.listener_port = get_port_value(value);
     break;
   case TLS_PORT_OPT:
-    turn_params.tls_listener_port = atoi(value);
+    turn_params.tls_listener_port = get_port_value(value);
+    turn_params.tls_port_configured = true;
     break;
   case ALT_PORT_OPT:
-    turn_params.alt_listener_port = atoi(value);
+    turn_params.alt_listener_port = get_port_value(value);
     break;
   case ALT_TLS_PORT_OPT:
-    turn_params.alt_tls_listener_port = atoi(value);
+    turn_params.alt_tls_listener_port = get_port_value(value);
+    turn_params.tls_port_configured = true;
     break;
   case TCP_PROXY_PORT_OPT:
-    turn_params.tcp_proxy_port = atoi(value);
-    turn_params.tcp_use_proxy = 1;
+    turn_params.tcp_proxy_port = get_port_value(value);
+    turn_params.tcp_use_proxy = true;
     break;
   case MIN_PORT_OPT:
-    turn_params.min_port = atoi(value);
+    turn_params.min_port = get_port_value(value);
     break;
   case MAX_PORT_OPT:
-    turn_params.max_port = atoi(value);
+    turn_params.max_port = get_port_value(value);
     break;
   case SOCK_BUF_SIZE_OPT:
     turn_params.sock_buf_size = atoi(value);
@@ -2100,6 +2365,23 @@ static void set_option(int c, char *value) {
     TURN_MAX_ALLOCATE_TIMEOUT = atoi(value);
     TURN_MAX_ALLOCATE_TIMEOUT_STUN_ONLY = atoi(value);
     break;
+  case DTLS_HALF_OPEN_TIMEOUT_OPT: {
+    int t = atoi(value);
+    if (t < 1) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "WARNING: dtls-half-open-timeout must be >= 1, using default %d\n",
+                    TURN_DTLS_HALF_OPEN_TIMEOUT);
+    } else {
+      TURN_DTLS_HALF_OPEN_TIMEOUT = t;
+    }
+  } break;
+  case DRAIN_MIN_ALLOCATIONS_OPT: {
+    int dma = get_int_value(value, 0);
+    if (dma < 0) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "WARNING: negative drain-min-allocations value %d ignored, using 0\n", dma);
+      dma = 0;
+    }
+    turn_params.drain_min_allocations = (size_t)dma;
+  } break;
   case 'S':
     turn_params.stun_only = get_bool_value(value);
     break;
@@ -2116,7 +2398,7 @@ static void set_option(int c, char *value) {
     if (value) {
       char *div = strchr(value, '/');
       if (div) {
-        char *nval = strdup(value);
+        char *nval = turn_strdup(value);
         div = strchr(nval, '/');
         div[0] = 0;
         ++div;
@@ -2195,7 +2477,12 @@ static void set_option(int c, char *value) {
     turn_params.fingerprint = get_bool_value(value);
     break;
   case 'u':
-    add_static_user_account(value);
+    /* A dropped --user leaves users_number at 0 and startup then selects
+     * TURN_CREDENTIALS_NONE when --lt-cred-mech was not set explicitly. */
+    if (add_static_user_account(value) < 0) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "CONFIG: cannot add static user account\n");
+      exit(-1);
+    }
     break;
   case 'b': {
 #if defined(TURN_NO_SQLITE)
@@ -2232,14 +2519,14 @@ static void set_option(int c, char *value) {
     break;
   case 'O':
     STRCPY(turn_params.redis_statsdb.connection_string, value);
-    turn_params.use_redis_statsdb = 1;
+    turn_params.use_redis_statsdb = true;
     break;
 #endif
   case PROMETHEUS_OPT:
     turn_params.prometheus = true;
     break;
   case PROMETHEUS_PORT_OPT:
-    turn_params.prometheus_port = atoi(value);
+    turn_params.prometheus_port = get_port_value(value);
     break;
   case PROMETHEUS_ADDRESS_OPT:
     STRCPY(turn_params.prometheus_address, value);
@@ -2249,6 +2536,20 @@ static void set_option(int c, char *value) {
     break;
   case PROMETHEUS_ENABLE_USERNAMES_OPT:
     turn_params.prometheus_username_labels = true;
+    break;
+  case PROMETHEUS_TLS_OPT:
+    turn_params.prometheus_tls = get_bool_value(value);
+    if (turn_params.prometheus_tls) {
+      /* Serving the metrics endpoint over TLS implies enabling the exporter,
+       * so --prometheus-tls alone is enough (no separate --prometheus needed). */
+      turn_params.prometheus = true;
+    }
+    break;
+  case PROMETHEUS_CERT_OPT:
+    STRCPY(turn_params.prometheus_cert_file, value);
+    break;
+  case PROMETHEUS_KEY_OPT:
+    STRCPY(turn_params.prometheus_pkey_file, value);
     break;
   case AUTH_SECRET_OPT:
     turn_params.use_auth_secret_with_timestamp = 1;
@@ -2311,16 +2612,17 @@ static void set_option(int c, char *value) {
     break;
   case NO_TLS_OPT:
 #if !TLS_SUPPORTED
-    turn_params.no_tls = 1;
+    turn_params.no_tls = true;
 #else
     turn_params.no_tls = get_bool_value(value);
 #endif
     break;
-  case NO_DTLS_OPT:
+  case DTLS_OPT:
 #if DTLS_SUPPORTED
-    turn_params.no_dtls = get_bool_value(value);
+    turn_params.dtls = get_bool_value(value);
 #else
-    turn_params.no_dtls = 1;
+    turn_params.dtls = false;
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "CONFIG: --dtls is ignored: this build has no DTLS support\n");
 #endif
     break;
   case CERT_FILE_OPT:
@@ -2356,14 +2658,34 @@ static void set_option(int c, char *value) {
   case TLS_ALTERNATE_SERVER_OPT:
     add_tls_alternate_server(value);
     break;
+  case TCP_ALTERNATE_SERVER_OPT:
+    add_tcp_alternate_server(value);
+    break;
+  case UDP_ALTERNATE_SERVER_OPT:
+    add_udp_alternate_server(value);
+    break;
   case ALLOWED_PEER_IPS:
     if (add_ip_list_range(value, NULL, &turn_params.ip_whitelist) == 0) {
       TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "White listing: %s\n", value);
+    } else {
+      /* Fail closed: a malformed allowed-peer-ips entry must abort startup so the operator
+         notices, instead of silently leaving the intended whitelist incomplete. */
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
+                    "Aborting: invalid allowed-peer-ip value %s. Use IP or IP-IP range (CIDR is not supported).\n",
+                    value);
+      exit(-1);
     }
     break;
   case DENIED_PEER_IPS:
     if (add_ip_list_range(value, NULL, &turn_params.ip_blacklist) == 0) {
       TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Black listing: %s\n", value);
+    } else {
+      /* Fail closed: a malformed denied-peer-ips entry would otherwise leave intended
+         blocks unenforced, exposing internal targets (SSRF-via-TURN). */
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
+                    "Aborting: invalid denied-peer-ip value %s. Use IP or IP-IP range (CIDR is not supported).\n",
+                    value);
+      exit(-1);
     }
     break;
   case CIPHER_LIST_OPT:
@@ -2391,16 +2713,58 @@ static void set_option(int c, char *value) {
   case STUN_BACKWARD_COMPATIBILITY_OPT:
     turn_params.stun_backward_compatibility = get_bool_value(value);
     break;
+  case RFC5766_CHANNEL_NUMBERS_OPT:
+    turn_params.rfc5766_channel_numbers = get_bool_value(value);
+    break;
+  case RFC3489_COMPATIBILITY_OPT:
+    turn_params.rfc3489_compatibility = get_bool_value(value);
+    break;
   case RESPONSE_ORIGIN_ONLY_WITH_RFC5780_OPT:
     break;
   case RESPOND_HTTP_UNSUPPORTED_OPT:
     turn_params.respond_http_unsupported = get_bool_value(value);
     break;
-  case DROP_INVALID_PACKETS_OPT:
-    turn_params.drop_invalid_packets = get_bool_value(value);
-    break;
   case DROP_INVALID_PACKETS_LOG_OPT:
     turn_params.drop_invalid_packets_log = get_bool_value(value);
+    break;
+#if defined(__linux__)
+  case UDP_RECVMMSG_OPT:
+    turn_params.udp_recvmmsg = get_bool_value(value);
+    break;
+  case UDP_RECVMMSG_LOG_OPT:
+    turn_params.udp_recvmmsg_log = get_bool_value(value);
+    break;
+  case UDP_SENDMMSG_LOG_OPT:
+    turn_params.udp_sendmmsg_log = get_bool_value(value);
+    break;
+  case UDP_GSO_OPT:
+    turn_params.udp_gso = get_bool_value(value);
+    break;
+#endif
+  case OPT_MULTIPLEX_PEER:
+    turn_params.multiplex_peer = true;
+    break;
+  case OPT_MULTIPLEX_PEER_PORT: {
+    const long parsed_port = strtol(value, NULL, 10);
+    if (parsed_port <= 0 || parsed_port > 65000) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "--multiplex-peer-port must be 1-65000\n");
+      exit(1);
+    }
+    const uint16_t p = (uint16_t)parsed_port;
+    turn_params.multiplex_peer_base_port = p;
+    break;
+  }
+  case OPT_MULTIPLEX_PEER_MAX_PEERS: {
+    const long parsed = strtol(value, NULL, 10);
+    if (parsed <= 0 || parsed > TURN_MP_PEERS_PER_SESSION_MAX) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "--multiplex-peer-max-peers must be 1-%d\n", TURN_MP_PEERS_PER_SESSION_MAX);
+      exit(1);
+    }
+    turn_params.multiplex_peer_max_peers = (size_t)parsed;
+    break;
+  }
+  case INCLUDE_REASON_STRING_OPT:
+    turn_params.include_reason_string = get_bool_value(value);
     break;
   case CPUS_OPT: {
     int cpus = atoi(value);
@@ -2416,12 +2780,56 @@ static void set_option(int c, char *value) {
       turn_params.cpus_configured = true;
     }
   } break;
+  case RATELIMIT_OPT:
+    if (value && !strcasecmp(value, "observe")) {
+      turn_params.ratelimit_unauthorized_mode = TURN_RATELIMIT_OBSERVE;
+    } else if (value && !strcasecmp(value, "enforce")) {
+      turn_params.ratelimit_unauthorized_mode = TURN_RATELIMIT_ENFORCE;
+    } else {
+      turn_params.ratelimit_unauthorized_mode = get_bool_value(value) ? TURN_RATELIMIT_ENFORCE : TURN_RATELIMIT_OFF;
+    }
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Unauthorized response rate-limiting: %s\n",
+                  turn_params.ratelimit_unauthorized_mode == TURN_RATELIMIT_ENFORCE   ? "enforce"
+                  : turn_params.ratelimit_unauthorized_mode == TURN_RATELIMIT_OBSERVE ? "observe"
+                                                                                      : "off");
+    break;
+  case RATELIMIT_RPS_OPT: {
+    int v = get_int_value(value, (int)RATELIMIT_DEFAULT_MAX_REQUESTS_PER_SEC);
+    if (v <= 0) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "Invalid --unauthorized-ratelimit-rps=%d (must be > 0); using default %u\n",
+                    v, RATELIMIT_DEFAULT_MAX_REQUESTS_PER_SEC);
+      v = (int)RATELIMIT_DEFAULT_MAX_REQUESTS_PER_SEC;
+    }
+    turn_params.ratelimit_unauthorized_requests_per_sec = v;
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Unauthorized rate-limit threshold: %d responses per second\n", v);
+  } break;
+  case STATELESS_NONCE_OPT:
+    turn_params.stateless_nonce = get_bool_value(value);
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Stateless nonce mode is %s\n",
+                  turn_params.stateless_nonce ? "enabled" : "disabled");
+    break;
+  case STATELESS_NONCE_SECRET_OPT:
+    if (value && value[0] &&
+        turn_derive_stateless_nonce_key((const uint8_t *)value, strlen(value), turn_params.stateless_nonce_key,
+                                        sizeof(turn_params.stateless_nonce_key))) {
+      turn_params.stateless_nonce_key_set = true;
+      if (!turn_params.stateless_nonce) {
+        turn_params.stateless_nonce = true;
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Stateless nonce mode is enabled (implied by --stateless-nonce-secret)\n");
+      }
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Stateless nonce key derived from the configured secret\n");
+    } else {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING,
+                    "Ignoring empty or invalid --stateless-nonce-secret; an ephemeral random key will be used\n");
+    }
+    break;
 
   /* these options have been already taken care of before: */
   case 'l':
   case NO_STDOUT_LOG_OPT:
   case SYSLOG_OPT:
   case SIMPLE_LOG_OPT:
+  case LOG_MIN_LEVEL_OPT:
   case NEW_LOG_TIMESTAMP_OPT:
   case NEW_LOG_TIMESTAMP_FORMAT_OPT:
   case SYSLOG_FACILITY_OPT:
@@ -2501,7 +2909,7 @@ static void read_config_file(int argc, char **argv, int pass) {
             TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "Wrong usage of -c option\n");
           }
         } else if (!strcmp(argv[i], "-n")) {
-          turn_params.do_not_use_config_file = 1;
+          turn_params.do_not_use_config_file = true;
           config_file[0] = 0;
           return;
         } else if (!strcmp(argv[i], "-h")) {
@@ -2545,7 +2953,7 @@ static void read_config_file(int argc, char **argv, int pass) {
         size_t slen = strlen(s);
 
         // strip white-spaces from config file lines end
-        while (slen && isspace(s[slen - 1])) {
+        while (slen && isspace((unsigned char)s[slen - 1])) {
           s[--slen] = 0;
         }
         if (slen) {
@@ -2562,8 +2970,10 @@ static void read_config_file(int argc, char **argv, int pass) {
             set_log_to_syslog(get_bool_value(value));
           } else if ((pass == 0) && (c == SIMPLE_LOG_OPT)) {
             set_simple_log(get_bool_value(value));
+          } else if ((pass == 0) && (c == LOG_MIN_LEVEL_OPT)) {
+            set_log_min_level(value);
           } else if ((pass == 0) && (c == NEW_LOG_TIMESTAMP_OPT)) {
-            use_new_log_timestamp_format = 1;
+            use_new_log_timestamp_format = get_bool_value(value);
           } else if ((pass == 0) && (c == NEW_LOG_TIMESTAMP_FORMAT_OPT)) {
             set_turn_log_timestamp_format(value);
           } else if ((pass == 0) && (c == SYSLOG_FACILITY_OPT)) {
@@ -2757,7 +3167,8 @@ static int adminmain(int argc, char **argv) {
     case 'p':
       STRCPY(pwd, optarg);
       if (!SASLprep((uint8_t *)pwd)) {
-        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong password: %s\n", pwd);
+        /* Do not log the value: it is the password. */
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong password: contains a character prohibited by RFC 4013\n");
         exit(-1);
       }
       if (print_enc_password) {
@@ -2835,11 +3246,7 @@ static int adminmain(int argc, char **argv) {
 static void print_features(unsigned long mfn) {
   TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Coturn Version %s\n", TURN_SOFTWARE);
   TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Max number of open files/sockets allowed for this process: %lu\n", mfn);
-  if (turn_params.net_engine_version == NEV_UDP_SOCKET_PER_ENDPOINT) {
-    mfn = mfn / 3;
-  } else {
-    mfn = mfn / 2;
-  }
+  mfn = mfn / 2;
   mfn = ((unsigned long)(mfn / 500)) * 500;
   if (mfn < 500) {
     mfn = 500;
@@ -2929,8 +3336,7 @@ static void print_features(unsigned long mfn) {
   TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "MongoDB is not supported\n");
 #endif
 
-  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Default Net Engine version: %d (%s)\n", (int)turn_params.net_engine_version,
-                turn_params.net_engine_version_txt[(int)turn_params.net_engine_version]);
+  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Net Engine: UDP thread per CPU core\n");
 }
 
 #if defined(__linux__) || defined(__LINUX__) || defined(__linux) || defined(linux__) || defined(LINUX) ||              \
@@ -2938,40 +3344,14 @@ static void print_features(unsigned long mfn) {
 #include <linux/version.h>
 #endif
 
-static void set_network_engine(void) {
-  if (turn_params.net_engine_version != NEV_UNKNOWN) {
-    return;
-  }
-  turn_params.net_engine_version = NEV_UDP_SOCKET_PER_ENDPOINT;
-#if defined(SO_REUSEPORT)
-#if defined(__linux__) || defined(__LINUX__) || defined(__linux) || defined(linux__) || defined(LINUX) ||              \
-    defined(__LINUX) || defined(LINUX__)
-  turn_params.net_engine_version = NEV_UDP_SOCKET_PER_THREAD;
-#else  /* BSD ? */
-  turn_params.net_engine_version = NEV_UDP_SOCKET_PER_SESSION;
-#endif /* Linux */
-#else  /* defined(SO_REUSEPORT) */
-#if defined(__linux__) || defined(__LINUX__) || defined(__linux) || defined(linux__) || defined(LINUX) ||              \
-    defined(__LINUX) || defined(LINUX__)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 33)
-  // net_engine_version = NEV_UDP_SOCKET_PER_SESSION;
-  turn_params.net_engine_version = NEV_UDP_SOCKET_PER_ENDPOINT;
-#else
-  turn_params.net_engine_version = NEV_UDP_SOCKET_PER_ENDPOINT;
-#endif /* Linux version */
-#endif /* Linux */
-#endif /* defined(SO_REUSEPORT) */
-}
-
 static void drop_privileges(void) {
 #if defined(WINDOWS)
   // TODO: implement it!!!
 #else
-  setgroups(0, NULL);
   if (procgroupid_set) {
     if (getgid() != procgroupid) {
       if (setgid(procgroupid) != 0) {
-        perror("setgid: Unable to change group privileges");
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "setgid: Unable to change group privileges: %s\n", strerror(errno));
         exit(-1);
       } else {
         TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "New GID: %s(%lu)\n", procgroupname, (unsigned long)procgroupid);
@@ -2983,8 +3363,13 @@ static void drop_privileges(void) {
 
   if (procuserid_set) {
     if (procuserid != getuid()) {
+      if (setgroups(0, NULL) != 0) {
+        perror("setgroups: Unable drop supplementary groups");
+        exit(-1);
+      }
+
       if (setuid(procuserid) != 0) {
-        perror("setuid: Unable to change user privileges");
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "setuid: Unable to change user privileges: %s\n", strerror(errno));
         exit(-1);
       } else {
         TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "New UID: %s(%lu)\n", procusername, (unsigned long)procuserid);
@@ -3006,8 +3391,145 @@ static void init_domain(void) {
 #endif
 }
 
+/* Extract candidate host strings from a DB connection string into out[],
+ * returning the count. Handles the space-separated key=value form used by the
+ * redis/mysql/pgsql drivers (host=/ip=/addr=/ipaddr=/hostaddr=) and the
+ * scheme://[user[:pass]@]host[:port][,host:port]/path URI form used by mongodb
+ * and pgsql URIs. */
+static size_t db_extract_hosts(const char *connstr, char out[][TURN_LONG_STRING_SIZE], size_t max) {
+  size_t n = 0;
+  if (!connstr || !connstr[0]) {
+    return 0;
+  }
+
+  if (strstr(connstr, "://")) {
+    /* URI form */
+    const char *p = strstr(connstr, "://") + 3;
+    size_t authlen = strcspn(p, "/?"); /* authority ends at first '/' or '?' */
+    char auth[TURN_LONG_STRING_SIZE] = {0};
+    if (authlen >= sizeof(auth)) {
+      authlen = sizeof(auth) - 1;
+    }
+    memcpy(auth, p, authlen);
+    char *at = strrchr(auth, '@'); /* drop any userinfo */
+    char *hostlist = at ? at + 1 : auth;
+    char *save = NULL;
+    for (char *tok = strtok_r(hostlist, ",", &save); tok && n < max; tok = strtok_r(NULL, ",", &save)) {
+      char host[TURN_LONG_STRING_SIZE] = {0};
+      if (tok[0] == '[') {
+        /* [IPv6]:port */
+        char *end = strchr(tok, ']');
+        if (end) {
+          size_t hl = (size_t)(end - (tok + 1));
+          if (hl >= sizeof(host)) {
+            hl = sizeof(host) - 1;
+          }
+          memcpy(host, tok + 1, hl);
+        }
+      } else {
+        size_t hl = strcspn(tok, ":"); /* strip :port */
+        if (hl >= sizeof(host)) {
+          hl = sizeof(host) - 1;
+        }
+        memcpy(host, tok, hl);
+      }
+      if (host[0]) {
+        STRCPY(out[n], host);
+        ++n;
+      }
+    }
+    return n;
+  }
+
+  /* key=value form (space-separated) */
+  char buf[TURN_LONG_STRING_SIZE] = {0};
+  STRCPY(buf, connstr);
+  char *save = NULL;
+  for (char *tok = strtok_r(buf, " ", &save); tok && n < max; tok = strtok_r(NULL, " ", &save)) {
+    char *eq = strchr(tok, '=');
+    if (!eq) {
+      continue;
+    }
+    *eq = 0;
+    const char *key = tok;
+    const char *val = eq + 1;
+    if (!strcmp(key, "host") || !strcmp(key, "ip") || !strcmp(key, "addr") || !strcmp(key, "ipaddr") ||
+        !strcmp(key, "hostaddr")) {
+      if (val[0]) {
+        STRCPY(out[n], val);
+        ++n;
+      }
+    }
+  }
+  return n;
+}
+
+/* Best-effort: deny the relay from ever connecting to one of coturn's own
+ * database backends, regardless of denied-peer-ip, so the relay cannot be used
+ * as an SSRF primitive against the auth/stats DB. */
+static void deny_one_db_connstr(const char *label, const char *connstr) {
+  char hosts[8][TURN_LONG_STRING_SIZE];
+  const size_t n = db_extract_hosts(connstr, hosts, 8);
+  if (n == 0) {
+    /* No explicit host: the redis/mysql/pgsql drivers then default to loopback,
+     * which good_peer_addr() already denies. Remote DBs always carry a host. */
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
+                  "Security: no explicit host in the %s connection string; backend assumed loopback (already "
+                  "denied). Add a denied-peer-ip if your database is remote.\n",
+                  label);
+    return;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (add_ip_list_range(hosts[i], NULL, &turn_params.ip_blacklist) == 0) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
+                    "Security: relay connections to the %s backend host %s are denied (auto denied-peer-ip)\n", label,
+                    hosts[i]);
+    } else {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING,
+                    "Security: could not resolve %s backend host %s to auto-deny it; add an explicit "
+                    "denied-peer-ip for it.\n",
+                    label, hosts[i]);
+    }
+  }
+}
+
+/* Auto-deny every configured database backend endpoint as a relay peer. */
+static void deny_self_db_endpoints(void) {
+  const persistent_users_db_t *pudb = &(turn_params.default_users_db.persistent_users_db);
+  switch (turn_params.default_users_db.userdb_type) {
+  case TURN_USERDB_TYPE_PQ:
+    deny_one_db_connstr("PostgreSQL userdb", pudb->userdb);
+    break;
+  case TURN_USERDB_TYPE_MYSQL:
+    deny_one_db_connstr("MySQL userdb", pudb->userdb);
+    break;
+  case TURN_USERDB_TYPE_MONGO:
+    deny_one_db_connstr("MongoDB userdb", pudb->userdb);
+    break;
+  case TURN_USERDB_TYPE_REDIS:
+    deny_one_db_connstr("Redis userdb", pudb->userdb);
+    break;
+  case TURN_USERDB_TYPE_SQLITE:
+  case TURN_USERDB_TYPE_UNKNOWN:
+  default:
+    break; /* SQLite is a local file -- no network endpoint to deny. */
+  }
+  if (turn_params.use_redis_statsdb && turn_params.redis_statsdb.connection_string[0]) {
+    deny_one_db_connstr("Redis stats DB", turn_params.redis_statsdb.connection_string);
+  }
+}
+
 int main(int argc, char **argv) {
   int c = 0;
+
+#if defined(OPENSSL_INIT_NO_ATEXIT)
+  /* Detached workers may still use OpenSSL when main returns. Suppress
+   * automatic cleanup until shutdown joins them (#1633). */
+  if (!strstr(argv[0], "turnadmin") && !OPENSSL_init_ssl(OPENSSL_INIT_NO_ATEXIT, NULL)) {
+    fprintf(stderr, "ERROR: Cannot initialize OpenSSL without automatic cleanup\n");
+    return EXIT_FAILURE;
+  }
+#endif
 
   IS_TURN_SERVER = 1;
 
@@ -3036,8 +3558,11 @@ int main(int argc, char **argv) {
       case SIMPLE_LOG_OPT:
         set_simple_log(get_bool_value(optarg));
         break;
+      case LOG_MIN_LEVEL_OPT:
+        set_log_min_level(optarg);
+        break;
       case NEW_LOG_TIMESTAMP_OPT:
-        use_new_log_timestamp_format = 1;
+        use_new_log_timestamp_format = get_bool_value(optarg);
         break;
       case NEW_LOG_TIMESTAMP_FORMAT_OPT:
         set_turn_log_timestamp_format(optarg);
@@ -3057,20 +3582,20 @@ int main(int argc, char **argv) {
 
   init_turn_server_addrs_list(&turn_params.alternate_servers_list);
   init_turn_server_addrs_list(&turn_params.tls_alternate_servers_list);
+  init_turn_server_addrs_list(&turn_params.tcp_alternate_servers_list);
+  init_turn_server_addrs_list(&turn_params.udp_alternate_servers_list);
   init_turn_server_addrs_list(&turn_params.aux_servers_list);
-
-  set_network_engine();
 
   init_listener();
   init_secrets_list(&turn_params.default_users_db.ram_db.static_auth_secrets);
   init_dynamic_ip_lists();
 
 #if !TLS_SUPPORTED
-  turn_params.no_tls = 1;
+  turn_params.no_tls = true;
 #endif
 
 #if !DTLS_SUPPORTED
-  turn_params.no_dtls = 1;
+  turn_params.dtls = false;
 #endif
 
   if (strstr(argv[0], "turnadmin")) {
@@ -3108,7 +3633,9 @@ int main(int argc, char **argv) {
     turn_params.cpus = MAX_NUMBER_OF_GENERAL_RELAY_SERVERS;
   }
 
-  turn_params.general_relay_servers_number = (turnserver_id)turn_params.cpus;
+  if (!turn_params.relay_threads_configured) {
+    turn_params.general_relay_servers_number = (turnserver_id)turn_params.cpus;
+  }
 
   TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "System cpu num is %lu\n", get_system_number_of_cpus());
   TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "System enable num is %lu\n", get_system_active_number_of_cpus());
@@ -3136,12 +3663,36 @@ int main(int argc, char **argv) {
   if (turn_params.oauth && turn_params.oauth_server_name[0]) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "oAuth server name: %s\n", turn_params.oauth_server_name);
   }
+  if (turn_params.oauth && turn_params.oauth_legacy_mac_key) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "WARNING: --oauth-legacy-mac-key: oAuth MESSAGE-INTEGRITY uses only 16 bytes "
+                                          "of the mac_key; RFC 7635 compliant clients will fail to authenticate\n");
+  }
 
   optind = 0;
 
   while (((c = getopt_long(argc, argv, OPTIONS, uo.u.o, NULL)) != -1)) {
     if (c == 'u') {
       set_option(c, optarg);
+    }
+  }
+
+#if defined(__linux__)
+  /* udp_sendmmsg is not a user-visible CLI flag; it is derived from the
+   * modes that benefit from batched UDP sends. --udp-recvmmsg is on by
+   * default (see turn_params initialiser); it provides the begin/end recvmmsg
+   * window that multiplex-peer's sendmmsg batching piggybacks on. Operators
+   * who want to opt out can pass --udp-recvmmsg=false. */
+  turn_params.udp_sendmmsg = turn_params.multiplex_peer;
+#endif
+
+  if (turn_params.rfc3489_compatibility) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING,
+                  "DEPRECATED: --rfc3489-compatibility enables handling of obsolete RFC 3489 (\"classic\" STUN) "
+                  "Binding requests. RFC 5389 deprecated those mechanisms in 2008 and RFC 8489 dropped them "
+                  "entirely. This option is scheduled for removal in the next major release, with no "
+                  "replacement. If you still need it, please report your use case upstream.\n");
+    if (turn_params.no_stun) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "--rfc3489-compatibility has no effect because --no-stun is also set.\n");
     }
   }
 
@@ -3208,7 +3759,7 @@ int main(int argc, char **argv) {
   if (use_cli && cli_password[0] == 0) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "CONFIG: Empty cli-password, and so telnet cli interface is disabled! "
                                         "Please set a non empty cli-password!\n");
-    use_cli = 0;
+    use_cli = false;
   }
 
   if (!use_lt_credentials && !anon_credentials) {
@@ -3240,6 +3791,18 @@ int main(int argc, char **argv) {
                     "anonymous user access option (-z or --no-auth option).	User accounts will be ignored.\n");
       turn_params.ct = TURN_CREDENTIALS_NONE;
       use_lt_credentials = 0;
+    }
+  }
+
+  if (turn_params.use_auth_secret_with_timestamp) {
+    hmackey_t probe = {0};
+    /* --use-auth-secret derives an MD5 long-term key per request; without MD5 no user can authenticate. */
+    if (!stun_produce_integrity_key_str((const uint8_t *)"u", (const uint8_t *)"r", (const uint8_t *)"p", probe,
+                                        SHATYPE_DEFAULT)) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
+                    "CONFIG: MD5 is unavailable from the OpenSSL providers (FIPS-only configuration?); "
+                    "--use-auth-secret cannot authenticate any user\n");
+      exit(-1);
     }
   }
 
@@ -3379,6 +3942,25 @@ int main(int argc, char **argv) {
   }
 #endif
 
+  /* Auto-deny coturn's own DB backend endpoints as relay peers (after all
+   * config is parsed, before servers bind their copy of the blacklist). */
+  deny_self_db_endpoints();
+
+  if (turn_params.ratelimit_unauthorized_mode != TURN_RATELIMIT_OFF) {
+    ratelimit_init();
+  }
+
+  if (turn_params.stateless_nonce && !turn_params.stateless_nonce_key_set) {
+    /* Process-wide ephemeral key for challenge nonces (no
+     * --stateless-nonce-secret configured). A restart invalidates outstanding
+     * nonces, which just re-triggers the standard 438 re-auth. */
+    if (RAND_bytes(turn_params.stateless_nonce_key, sizeof(turn_params.stateless_nonce_key)) != 1) {
+      for (size_t i = 0; i < sizeof(turn_params.stateless_nonce_key); ++i) {
+        turn_params.stateless_nonce_key[i] = (uint8_t)turn_random_number();
+      }
+    }
+  }
+
   setup_server();
 
 #if defined(WINDOWS)
@@ -3399,6 +3981,8 @@ int main(int argc, char **argv) {
   start_prometheus_server();
 
   run_listener_server(&(turn_params.listener));
+
+  shutdown_server();
 
   disconnect_database();
 
@@ -3447,8 +4031,8 @@ static void adjust_key_file_name(char *fn, const char *file_title, int critical)
 
 keyerr:
   if (critical) {
-    turn_params.no_tls = 1;
-    turn_params.no_dtls = 1;
+    turn_params.no_tls = true;
+    turn_params.dtls = false;
     TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "cannot start TLS and DTLS listeners because %s file is not set properly\n",
                   file_title);
   }
@@ -3468,7 +4052,7 @@ static void adjust_key_file_names(void) {
     adjust_key_file_name(turn_params.dh_file, "DH key", 0);
   }
 }
-static DH *get_dh566(void) {
+static EVP_PKEY *get_dh566(void) {
 
   unsigned char dh566_p[] = {0x36, 0x53, 0xA8, 0x9C, 0x3C, 0xF1, 0xD1, 0x1B, 0x2D, 0xA2, 0x64, 0xDE, 0x59, 0x3B, 0xE3,
                              0x8C, 0x27, 0x74, 0xC2, 0xBE, 0x9B, 0x6D, 0x56, 0xE7, 0xDF, 0xFF, 0x67, 0x6A, 0xD2, 0x0C,
@@ -3482,16 +4066,33 @@ static DH *get_dh566(void) {
   //	-----END DH PARAMETERS-----
 
   unsigned char dh566_g[] = {0x05};
-  DH *dh;
 
-  if ((dh = DH_new()) == NULL) {
-    return (NULL);
+  BIGNUM *p = BN_bin2bn(dh566_p, sizeof(dh566_p), NULL);
+  BIGNUM *g = BN_bin2bn(dh566_g, sizeof(dh566_g), NULL);
+  if (!p || !g) {
+    BN_free(p);
+    BN_free(g);
+    return NULL;
   }
-  DH_set0_pqg(dh, BN_bin2bn(dh566_p, sizeof(dh566_p), NULL), NULL, BN_bin2bn(dh566_g, sizeof(dh566_g), NULL));
-  return (dh);
+
+  OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+  OSSL_PARAM_BLD_push_BN(bld, "p", p);
+  OSSL_PARAM_BLD_push_BN(bld, "g", g);
+  OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(bld);
+  OSSL_PARAM_BLD_free(bld);
+  BN_free(p);
+  BN_free(g);
+
+  EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL);
+  EVP_PKEY *pkey = NULL;
+  EVP_PKEY_fromdata_init(pctx);
+  EVP_PKEY_fromdata(pctx, &pkey, EVP_PKEY_KEY_PARAMETERS, params);
+  EVP_PKEY_CTX_free(pctx);
+  OSSL_PARAM_free(params);
+  return pkey;
 }
 
-static DH *get_dh1066(void) {
+static EVP_PKEY *get_dh1066(void) {
 
   unsigned char dh1066_p[] = {0x02, 0x0E, 0x26, 0x6F, 0xAA, 0x9F, 0xA8, 0xE5, 0x3F, 0x70, 0x88, 0xF1, 0xA9, 0x29, 0xAE,
                               0x1A, 0x2B, 0xA8, 0x2F, 0xE8, 0xE5, 0x0E, 0x81, 0x78, 0xD7, 0x12, 0x41, 0xDC, 0xE2, 0xD5,
@@ -3510,16 +4111,33 @@ static DH *get_dh1066(void) {
   //	-----END DH PARAMETERS-----
 
   unsigned char dh1066_g[] = {0x02};
-  DH *dh;
 
-  if ((dh = DH_new()) == NULL) {
-    return (NULL);
+  BIGNUM *p = BN_bin2bn(dh1066_p, sizeof(dh1066_p), NULL);
+  BIGNUM *g = BN_bin2bn(dh1066_g, sizeof(dh1066_g), NULL);
+  if (!p || !g) {
+    BN_free(p);
+    BN_free(g);
+    return NULL;
   }
-  DH_set0_pqg(dh, BN_bin2bn(dh1066_p, sizeof(dh1066_p), NULL), NULL, BN_bin2bn(dh1066_g, sizeof(dh1066_g), NULL));
-  return (dh);
+
+  OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+  OSSL_PARAM_BLD_push_BN(bld, "p", p);
+  OSSL_PARAM_BLD_push_BN(bld, "g", g);
+  OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(bld);
+  OSSL_PARAM_BLD_free(bld);
+  BN_free(p);
+  BN_free(g);
+
+  EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL);
+  EVP_PKEY *pkey = NULL;
+  EVP_PKEY_fromdata_init(pctx);
+  EVP_PKEY_fromdata(pctx, &pkey, EVP_PKEY_KEY_PARAMETERS, params);
+  EVP_PKEY_CTX_free(pctx);
+  OSSL_PARAM_free(params);
+  return pkey;
 }
 
-static DH *get_dh2066(void) {
+static EVP_PKEY *get_dh2066(void) {
 
   unsigned char dh2066_p[] = {
       0x03, 0x31, 0x77, 0x20, 0x58, 0xA6, 0x69, 0xA3, 0x9D, 0x2D, 0x5E, 0xE0, 0x5C, 0x46, 0x82, 0x0F, 0x9E, 0x80, 0xF0,
@@ -3547,13 +4165,30 @@ static DH *get_dh2066(void) {
   //	-----END DH PARAMETERS-----
 
   unsigned char dh2066_g[] = {0x05};
-  DH *dh;
 
-  if ((dh = DH_new()) == NULL) {
-    return (NULL);
+  BIGNUM *p = BN_bin2bn(dh2066_p, sizeof(dh2066_p), NULL);
+  BIGNUM *g = BN_bin2bn(dh2066_g, sizeof(dh2066_g), NULL);
+  if (!p || !g) {
+    BN_free(p);
+    BN_free(g);
+    return NULL;
   }
-  DH_set0_pqg(dh, BN_bin2bn(dh2066_p, sizeof(dh2066_p), NULL), NULL, BN_bin2bn(dh2066_g, sizeof(dh2066_g), NULL));
-  return (dh);
+
+  OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+  OSSL_PARAM_BLD_push_BN(bld, "p", p);
+  OSSL_PARAM_BLD_push_BN(bld, "g", g);
+  OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(bld);
+  OSSL_PARAM_BLD_free(bld);
+  BN_free(p);
+  BN_free(g);
+
+  EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL);
+  EVP_PKEY *pkey = NULL;
+  EVP_PKEY_fromdata_init(pctx);
+  EVP_PKEY_fromdata(pctx, &pkey, EVP_PKEY_KEY_PARAMETERS, params);
+  EVP_PKEY_CTX_free(pctx);
+  OSSL_PARAM_free(params);
+  return pkey;
 }
 
 static int pem_password_func(char *buf, int size, int rwflag, void *password) {
@@ -3594,7 +4229,8 @@ static int ServerALPNCallback(SSL *ssl, const unsigned char **out, unsigned char
       SSL_set_app_data(ssl, TURN_ALPN);
       return SSL_TLSEXT_ERR_OK;
     }
-    if ((current_len == ha_len) && (memcmp(ptr + 1, HTTP_ALPN, ha_len) == 0)) {
+    if ((use_web_admin || turn_params.respond_http_unsupported) && (current_len == ha_len) &&
+        (memcmp(ptr + 1, HTTP_ALPN, ha_len) == 0)) {
       *out = ptr + 1;
       *outlen = ha_len;
       SSL_set_app_data(ssl, HTTP_ALPN);
@@ -3607,7 +4243,8 @@ static int ServerALPNCallback(SSL *ssl, const unsigned char **out, unsigned char
     return SSL_TLSEXT_ERR_OK;
   }
 
-  return SSL_TLSEXT_ERR_NOACK; //???
+  /* RFC 7301 Section 3.2: no protocol in common requires a fatal no_application_protocol alert. */
+  return SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
 static void set_ctx(SSL_CTX **out, const char *protocol, const SSL_METHOD *method) {
@@ -3637,11 +4274,9 @@ static void set_ctx(SSL_CTX **out, const char *protocol, const SSL_METHOD *metho
   }
 
   if (!SSL_CTX_use_PrivateKey_file(ctx, turn_params.pkey_file, SSL_FILETYPE_PEM)) {
-    if (!SSL_CTX_use_RSAPrivateKey_file(ctx, turn_params.pkey_file, SSL_FILETYPE_PEM)) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
-                    "%s: ERROR: no valid private key found, or invalid private key password provided\n", protocol);
-      err = 1;
-    }
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
+                  "%s: ERROR: no valid private key found, or invalid private key password provided\n", protocol);
+    err = 1;
   }
   if (!SSL_CTX_check_private_key(ctx)) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: invalid private key\n", protocol);
@@ -3672,7 +4307,7 @@ static void set_ctx(SSL_CTX **out, const char *protocol, const SSL_METHOD *metho
     int nid = 0;
     int set_auto_curve = 0;
 
-    const char *curve_name = turn_params.ec_curve_name;
+    char *curve_name = turn_params.ec_curve_name;
 
     if (!(curve_name[0])) {
 #if !SSL_SESSION_ECDH_AUTO_SUPPORTED
@@ -3687,19 +4322,14 @@ static void set_ctx(SSL_CTX **out, const char *protocol, const SSL_METHOD *metho
         if (nid == 0) {
           TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "unknown curve name: %s\n", curve_name);
           curve_name = DEFAULT_EC_CURVE_NAME;
-          nid = OBJ_sn2nid(curve_name);
           set_auto_curve = 1;
         }
       }
 
       {
-        EC_KEY *ecdh = EC_KEY_new_by_curve_name(nid);
-        if (!ecdh) {
-          TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: allocate EC suite\n", __FUNCTION__);
+        if (SSL_CTX_set1_groups_list(ctx, curve_name) != 1) {
+          TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: set EC curve '%s' failed\n", __FUNCTION__, curve_name);
           set_auto_curve = 1;
-        } else {
-          SSL_CTX_set_tmp_ecdh(ctx, ecdh);
-          EC_KEY_free(ecdh);
         }
       }
     }
@@ -3712,13 +4342,20 @@ static void set_ctx(SSL_CTX **out, const char *protocol, const SSL_METHOD *metho
 
   { // DH algorithms:
 
-    DH *dh = NULL;
+    EVP_PKEY *dh = NULL;
     if (turn_params.dh_file[0]) {
       FILE *paramfile = fopen(turn_params.dh_file, "r");
       if (!paramfile) {
-        perror("Cannot open DH file");
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot open DH file: %s\n", strerror(errno));
       } else {
-        dh = PEM_read_DHparams(paramfile, NULL, NULL, NULL);
+        OSSL_DECODER_CTX *dctx =
+            OSSL_DECODER_CTX_new_for_pkey(&dh, "PEM", NULL, "DH", EVP_PKEY_KEY_PARAMETERS, NULL, NULL);
+        if (dctx) {
+          if (!OSSL_DECODER_from_fp(dctx, paramfile)) {
+            dh = NULL;
+          }
+          OSSL_DECODER_CTX_free(dctx);
+        }
         fclose(paramfile);
         if (dh) {
           turn_params.dh_key_size = DH_CUSTOM;
@@ -3740,11 +4377,11 @@ static void set_ctx(SSL_CTX **out, const char *protocol, const SSL_METHOD *metho
       TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: cannot allocate DH suite\n", __FUNCTION__);
       err = 1;
     } else {
-      if (1 != SSL_CTX_set_tmp_dh(ctx, dh)) {
+      if (1 != SSL_CTX_set0_tmp_dh_pkey(ctx, dh)) {
         TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: cannot set DH\n", __FUNCTION__);
         err = 1;
       }
-      DH_free(dh);
+      // No EVP_PKEY_free: SSL_CTX_set0_tmp_dh_pkey always takes ownership
     }
   }
 
@@ -3754,7 +4391,7 @@ static void set_ctx(SSL_CTX **out, const char *protocol, const SSL_METHOD *metho
       FILE *f = fopen(turn_params.secret_key_file, "r");
 
       if (!f) {
-        perror("Cannot open Secret-Key file");
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot open Secret-Key file: %s\n", strerror(errno));
       } else {
         fseek(f, 0, SEEK_SET);
         rc = fread(turn_params.secret_key, sizeof(char), 16, f);
@@ -3825,26 +4462,34 @@ static void openssl_setup(void) {
 #if !TLS_SUPPORTED
   if (!turn_params.no_tls) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "WARNING: TLS is not supported\n");
-    turn_params.no_tls = 1;
+    turn_params.no_tls = true;
   }
 #endif
 
-  if (!(turn_params.no_tls && turn_params.no_dtls) && !turn_params.cert_file[0]) {
+  if ((!turn_params.no_tls || turn_params.dtls) && !turn_params.cert_file[0]) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "\nWARNING: certificate file is not specified, I cannot start TLS/DTLS "
                                           "services.\nOnly 'plain' UDP/TCP listeners can be started.\n");
-    turn_params.no_tls = 1;
-    turn_params.no_dtls = 1;
+    turn_params.no_tls = true;
+    turn_params.dtls = false;
   }
 
-  if (!(turn_params.no_tls && turn_params.no_dtls) && !turn_params.pkey_file[0]) {
+  if ((!turn_params.no_tls || turn_params.dtls) && !turn_params.pkey_file[0]) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "\nWARNING: private key file is not specified, I cannot start TLS/DTLS "
                                           "services.\nOnly 'plain' UDP/TCP listeners can be started.\n");
-    turn_params.no_tls = 1;
-    turn_params.no_dtls = 1;
+    turn_params.no_tls = true;
+    turn_params.dtls = false;
   }
 
-  if (!(turn_params.no_tls && turn_params.no_dtls)) {
+  if (!turn_params.no_tls || turn_params.dtls) {
     adjust_key_file_names();
+  }
+
+  if (turn_params.tls_port_configured && turn_params.no_tls && !turn_params.dtls) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
+                  "tls-listening-port %d is configured, but the TLS and DTLS listeners are disabled "
+                  "(see the messages above). The server will NOT listen on that port. Set valid 'cert' and "
+                  "'pkey' files (readable by the turnserver process) to enable TLS/DTLS.\n",
+                  (int)turn_params.tls_listener_port);
   }
 
   openssl_load_certificates();
@@ -3874,7 +4519,7 @@ static void openssl_load_certificates(void) {
 #endif
   }
 
-  if (!turn_params.no_dtls) {
+  if (turn_params.dtls) {
 #if !DTLS_SUPPORTED
     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "ERROR: DTLS is not supported.\n");
 #else
@@ -3885,6 +4530,10 @@ static void openssl_load_certificates(void) {
     setup_dtls_callbacks(turn_params.dtls_ctx);
     TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "DTLS cipher suite: %s\n", turn_params.cipher_list);
 #endif
+  } else if (!turn_params.no_tls) {
+    /* The certificates are usable, so the operator may well have expected the
+     * DTLS listeners to come up with the TLS ones. */
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "DTLS listeners are not started; use --dtls to start them\n");
   }
   TURN_MUTEX_UNLOCK(&turn_params.tls_mutex);
 }
@@ -3904,6 +4553,10 @@ static void reload_ssl_certs(evutil_socket_t sock, short events, void *args) {
 static void shutdown_handler(evutil_socket_t sock, short events, void *args) {
   TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Terminating on signal %d\n", sock);
   turn_params.stop_turn_server = true;
+  /* The listener loop otherwise notices the flag only on its next 5-second loopexit tick. */
+  if (turn_params.listener.event_base) {
+    event_base_loopbreak(turn_params.listener.event_base);
+  }
 
   UNUSED_ARG(events);
   UNUSED_ARG(args);
@@ -3919,7 +4572,11 @@ static void drain_handler(evutil_socket_t sock, short events, void *args) {
 
 void increment_global_allocation_count(void) {
 #ifdef _MSC_VER
-  size_t cur_count = InterlockedIncrement(&global_allocation_count);
+#if SIZE_MAX > 0xFFFFFFFFu
+  size_t cur_count = (size_t)InterlockedIncrement64((volatile LONG64 *)&global_allocation_count);
+#else
+  size_t cur_count = (size_t)InterlockedIncrement((volatile LONG *)&global_allocation_count);
+#endif
 #else
   size_t cur_count = ++global_allocation_count;
 #endif
@@ -3934,7 +4591,11 @@ void decrement_global_allocation_count(void) {
     log_level = TURN_LOG_LEVEL_INFO;
   }
 #ifdef _MSC_VER
-  size_t cur_count = InterlockedDecrement(&global_allocation_count);
+#if SIZE_MAX > 0xFFFFFFFFu
+  size_t cur_count = (size_t)InterlockedDecrement64((volatile LONG64 *)&global_allocation_count);
+#else
+  size_t cur_count = (size_t)InterlockedDecrement((volatile LONG *)&global_allocation_count);
+#endif
 #else
   size_t cur_count = --global_allocation_count;
 #endif

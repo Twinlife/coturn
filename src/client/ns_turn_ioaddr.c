@@ -34,7 +34,8 @@
 
 #include "ns_turn_ioaddr.h"
 
-#include "ns_turn_defs.h" // for nswap16, nswap32, STRCPY
+#include "ns_turn_defs.h"  // for nswap16, nswap32, STRCPY
+#include "ns_turn_utils.h" // for turn_malloc, turn_calloc, turn_realloc, turn_strdup
 
 #include <stdio.h>  // for snprintf, fprintf, stderr
 #include <stdlib.h> // for atoi, malloc, realloc, free
@@ -43,19 +44,6 @@
 #if defined(__unix__) || defined(unix) || defined(__APPLE__)
 #include <netdb.h>
 #endif
-
-//////////////////////////////////////////////////////////////
-
-uint32_t get_ioa_addr_len(const ioa_addr *addr) {
-  if (addr->ss.sa_family == AF_INET) {
-    return sizeof(struct sockaddr_in);
-  } else if (addr->ss.sa_family == AF_INET6) {
-    return sizeof(struct sockaddr_in6);
-  }
-  return 0;
-}
-
-///////////////////////////////////////////////////////////////
 
 void addr_set_any(ioa_addr *addr) {
   if (addr) {
@@ -152,11 +140,7 @@ uint32_t addr_hash_no_port(const ioa_addr *addr) {
   return ret;
 }
 
-void addr_cpy(ioa_addr *dst, const ioa_addr *src) {
-  if (dst && src) {
-    memcpy(dst, src, sizeof(ioa_addr));
-  }
-}
+/* addr_cpy is now defined as static inline in ns_turn_ioaddr.h. */
 
 void addr_cpy4(ioa_addr *dst, const struct sockaddr_in *src) {
   if (src && dst) {
@@ -215,7 +199,7 @@ int addr_eq_no_port(const ioa_addr *a1, const ioa_addr *a2) {
   return 0;
 }
 
-int make_ioa_addr(const uint8_t *saddr0, int port, ioa_addr *addr) {
+int make_ioa_addr(const uint8_t *saddr0, uint16_t port, ioa_addr *addr) {
 
   if (!saddr0 || !addr) {
     return -1;
@@ -315,7 +299,7 @@ int make_ioa_addr(const uint8_t *saddr0, int port, ioa_addr *addr) {
   return 0;
 }
 
-static char *get_addr_string_and_port(char *s0, int *port) {
+static char *get_addr_string_and_port(char *s0, uint16_t *port) {
   char *s = s0;
   while (*s && (*s == ' ')) {
     ++s;
@@ -353,14 +337,14 @@ static char *get_addr_string_and_port(char *s0, int *port) {
   return NULL;
 }
 
-int make_ioa_addr_from_full_string(const uint8_t *saddr, int default_port, ioa_addr *addr) {
+int make_ioa_addr_from_full_string(const uint8_t *saddr, uint16_t default_port, ioa_addr *addr) {
   if (!addr) {
     return -1;
   }
 
   int ret = -1;
-  int port = 0;
-  char *s = strdup((const char *)saddr);
+  uint16_t port = 0;
+  char *s = turn_strdup((const char *)saddr);
   char *sa = get_addr_string_and_port(s, &port);
   if (sa) {
     if (port < 1) {
@@ -372,25 +356,25 @@ int make_ioa_addr_from_full_string(const uint8_t *saddr, int default_port, ioa_a
   return ret;
 }
 
-int addr_to_string(const ioa_addr *addr, uint8_t *saddr) {
+int addr_to_string(const ioa_addr *addr, char *saddr) {
 
   if (addr && saddr) {
-
+    saddr[0] = '\0';
     char addrtmp[INET6_ADDRSTRLEN];
 
     if (addr->ss.sa_family == AF_INET) {
       inet_ntop(AF_INET, &addr->s4.sin_addr, addrtmp, INET_ADDRSTRLEN);
       if (addr_get_port(addr) > 0) {
-        snprintf((char *)saddr, MAX_IOA_ADDR_STRING, "%s:%d", addrtmp, addr_get_port(addr));
+        snprintf(saddr, MAX_IOA_ADDR_STRING, "%s:%d", addrtmp, addr_get_port(addr));
       } else {
-        strncpy((char *)saddr, addrtmp, MAX_IOA_ADDR_STRING);
+        snprintf(saddr, MAX_IOA_ADDR_STRING, "%s", addrtmp);
       }
     } else if (addr->ss.sa_family == AF_INET6) {
       inet_ntop(AF_INET6, &addr->s6.sin6_addr, addrtmp, INET6_ADDRSTRLEN);
       if (addr_get_port(addr) > 0) {
-        snprintf((char *)saddr, MAX_IOA_ADDR_STRING, "[%s]:%d", addrtmp, addr_get_port(addr));
+        snprintf(saddr, MAX_IOA_ADDR_STRING, "[%s]:%d", addrtmp, addr_get_port(addr));
       } else {
-        strncpy((char *)saddr, addrtmp, MAX_IOA_ADDR_STRING);
+        snprintf(saddr, MAX_IOA_ADDR_STRING, "%s", addrtmp);
       }
     } else {
       return -1;
@@ -402,18 +386,14 @@ int addr_to_string(const ioa_addr *addr, uint8_t *saddr) {
   return -1;
 }
 
-int addr_to_string_no_port(const ioa_addr *addr, uint8_t *saddr) {
+int addr_to_string_no_port(const ioa_addr *addr, char *saddr) {
 
   if (addr && saddr) {
-
-    char addrtmp[MAX_IOA_ADDR_STRING];
-
+    saddr[0] = '\0';
     if (addr->ss.sa_family == AF_INET) {
-      inet_ntop(AF_INET, &addr->s4.sin_addr, addrtmp, INET_ADDRSTRLEN);
-      strncpy((char *)saddr, addrtmp, MAX_IOA_ADDR_STRING);
+      inet_ntop(AF_INET, &addr->s4.sin_addr, saddr, INET_ADDRSTRLEN);
     } else if (addr->ss.sa_family == AF_INET6) {
-      inet_ntop(AF_INET6, &addr->s6.sin6_addr, addrtmp, INET6_ADDRSTRLEN);
-      strncpy((char *)saddr, addrtmp, MAX_IOA_ADDR_STRING);
+      inet_ntop(AF_INET6, &addr->s6.sin6_addr, saddr, INET6_ADDRSTRLEN);
     } else {
       return -1;
     }
@@ -424,7 +404,7 @@ int addr_to_string_no_port(const ioa_addr *addr, uint8_t *saddr) {
   return -1;
 }
 
-void addr_set_port(ioa_addr *addr, int port) {
+void addr_set_port(ioa_addr *addr, uint16_t port) {
   if (addr) {
     if (addr->s4.sin_family == AF_INET) {
       addr->s4.sin_port = nswap16(port);
@@ -434,7 +414,7 @@ void addr_set_port(ioa_addr *addr, int port) {
   }
 }
 
-int addr_get_port(const ioa_addr *addr) {
+uint16_t addr_get_port(const ioa_addr *addr) {
   if (!addr) {
     return 0;
   }
@@ -476,23 +456,76 @@ int addr_less_eq(const ioa_addr *addr1, const ioa_addr *addr2) {
     } else if (addr1->ss.sa_family == AF_INET) {
       return ((uint32_t)nswap32(addr1->s4.sin_addr.s_addr) <= (uint32_t)nswap32(addr2->s4.sin_addr.s_addr));
     } else if (addr1->ss.sa_family == AF_INET6) {
-      int i;
-      for (i = 0; i < 16; i++) {
-        if ((uint8_t)(((const char *)&(addr1->s6.sin6_addr))[i]) >
-            (uint8_t)(((const char *)&(addr2->s6.sin6_addr))[i])) {
-          return 0;
-        }
-      }
-      return 1;
+      /* in6_addr is stored MSB-first (network order), so a byte-wise memcmp is
+       * the lexicographic total order. A component-wise per-byte comparison
+       * would test a rectangular box, not the contiguous span [min,max], and
+       * under-block IPv6 denied-peer-ip ranges. */
+      return memcmp(&(addr1->s6.sin6_addr), &(addr2->s6.sin6_addr), 16) <= 0;
     } else {
       return 1;
     }
   }
 }
 
+bool ioa_addr_get_embedded_ipv4(const ioa_addr *addr, ioa_addr *embedded) {
+  if (!addr || !embedded || addr->ss.sa_family != AF_INET6) {
+    return false;
+  }
+
+  const uint8_t *u = (const uint8_t *)&(addr->s6.sin6_addr);
+  const uint8_t *v4 = NULL;
+
+  if (u[0] == 0 && u[1] == 0 && u[2] == 0 && u[3] == 0 && u[4] == 0 && u[5] == 0 && u[6] == 0 && u[7] == 0 &&
+      u[8] == 0 && u[9] == 0 && u[10] == 0xff && u[11] == 0xff) {
+    /* IPv4-mapped: ::ffff:a.b.c.d (::ffff:0:0/96) */
+    v4 = u + 12;
+  } else if (u[0] == 0x20 && u[1] == 0x02) {
+    /* 6to4: 2002:AABB:CCDD::/16 -> embedded IPv4 is bytes 2..5 */
+    v4 = u + 2;
+  } else if (u[0] == 0x00 && u[1] == 0x64 && u[2] == 0xff && u[3] == 0x9b && u[4] == 0 && u[5] == 0 && u[6] == 0 &&
+             u[7] == 0 && u[8] == 0 && u[9] == 0 && u[10] == 0 && u[11] == 0) {
+    /* NAT64 well-known prefix: 64:ff9b::/96 -> embedded IPv4 is bytes 12..15 */
+    v4 = u + 12;
+  } else if (u[0] == 0 && u[1] == 0 && u[2] == 0 && u[3] == 0 && u[4] == 0 && u[5] == 0 && u[6] == 0 && u[7] == 0 &&
+             u[8] == 0 && u[9] == 0 && u[10] == 0 && u[11] == 0) {
+    /* IPv4-compatible: ::a.b.c.d (::/96). Intentionally skip :: (unspecified)
+     * and ::1 (IPv6 loopback) -- those are handled natively by ioa_addr_is_zero
+     * and ioa_addr_is_loopback and must not be reduced to a 0.0.0.x IPv4. */
+    if (!(u[12] == 0 && u[13] == 0 && u[14] == 0 && (u[15] == 0 || u[15] == 1))) {
+      v4 = u + 12;
+    }
+  }
+
+  if (!v4) {
+    return false;
+  }
+
+  memset(embedded, 0, sizeof(*embedded));
+  embedded->s4.sin_family = AF_INET;
+  memcpy(&(embedded->s4.sin_addr), v4, 4);
+  embedded->s4.sin_port = addr->s6.sin6_port;
+  return true;
+}
+
 int ioa_addr_in_range(const ioa_addr_range *range, const ioa_addr *addr) {
 
   if (range && addr) {
+    /* Reduce every IPv4-in-IPv6 encoding (IPv4-mapped, IPv4-compatible, 6to4,
+     * NAT64) to its embedded IPv4 before comparing against an AF_INET range, so
+     * an attacker cannot dodge an IPv4 denied-peer-ip range by re-encoding the
+     * same target address. */
+    ioa_addr embedded;
+    if (addr->ss.sa_family == AF_INET6) {
+      /* int, not sa_family_t: this path is now compiled on Windows too, where
+       * MinGW does not define sa_family_t. */
+      int range_family = range->min.ss.sa_family;
+      if (range_family == 0) {
+        range_family = range->max.ss.sa_family;
+      }
+      if (range_family == AF_INET && ioa_addr_get_embedded_ipv4(addr, &embedded)) {
+        addr = &embedded;
+      }
+    }
     if (addr_any(&(range->min)) || addr_less_eq(&(range->min), addr)) {
       if (addr_any(&(range->max))) {
         return 1;
@@ -516,12 +549,19 @@ void ioa_addr_range_cpy(ioa_addr_range *dest, const ioa_addr_range *src) {
 
 int ioa_addr_is_multicast(ioa_addr *addr) {
   if (addr) {
+    /* Canonicalize any IPv4-in-IPv6 encoding to its embedded IPv4 first, so the
+     * IPv4 multicast test applies regardless of how the address was encoded. */
+    ioa_addr embedded;
+    if (ioa_addr_get_embedded_ipv4(addr, &embedded)) {
+      addr = &embedded;
+    }
     if (addr->ss.sa_family == AF_INET) {
       const uint8_t *u = ((const uint8_t *)&(addr->s4.sin_addr));
       return (u[0] > 223);
     } else if (addr->ss.sa_family == AF_INET6) {
-      const uint8_t u = ((const uint8_t *)&(addr->s6.sin6_addr))[0];
-      return (u == 255);
+      const uint8_t *u = ((const uint8_t *)&(addr->s6.sin6_addr));
+      /* Native IPv6 multicast: ff00::/8 */
+      return (u[0] == 255);
     }
   }
   return 0;
@@ -529,11 +569,19 @@ int ioa_addr_is_multicast(ioa_addr *addr) {
 
 int ioa_addr_is_loopback(ioa_addr *addr) {
   if (addr) {
+    /* Canonicalize any IPv4-in-IPv6 encoding to its embedded IPv4 first. This
+     * covers ::ffff:127.0.0.1 / ::127.0.0.1 / 64:ff9b::7f00:1 / 2002:7f00:1::1 encodings of the
+     * IPv4 loopback range. The native ::1 literal is left for the branch below. */
+    ioa_addr embedded;
+    if (ioa_addr_get_embedded_ipv4(addr, &embedded)) {
+      addr = &embedded;
+    }
     if (addr->ss.sa_family == AF_INET) {
       const uint8_t *u = ((const uint8_t *)&(addr->s4.sin_addr));
       return (u[0] == 127);
     } else if (addr->ss.sa_family == AF_INET6) {
       const uint8_t *u = ((const uint8_t *)&(addr->s6.sin6_addr));
+      /* Native IPv6 loopback: ::1 */
       if (u[15] == 1) {
         int i;
         for (i = 0; i < 15; ++i) {
@@ -556,6 +604,13 @@ To avoid any trouble we match the whole 0.0.0.0/8 that defined in RFC6890 as loc
 */
 int ioa_addr_is_zero(ioa_addr *addr) {
   if (addr) {
+    /* Canonicalize any IPv4-in-IPv6 encoding to its embedded IPv4 first so the
+     * 0.0.0.0/8 test applies regardless of encoding (e.g. ::ffff:0.0.0.0). The
+     * bare :: (unspecified) literal is not reduced and is caught natively. */
+    ioa_addr embedded;
+    if (ioa_addr_get_embedded_ipv4(addr, &embedded)) {
+      addr = &embedded;
+    }
     if (addr->ss.sa_family == AF_INET) {
       const uint8_t *u = ((const uint8_t *)&(addr->s4.sin_addr));
       return (u[0] == 0);
@@ -567,6 +622,41 @@ int ioa_addr_is_zero(ioa_addr *addr) {
           return 0;
         }
       }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int ioa_addr_is_internal_deny_default(ioa_addr *addr) {
+  if (!addr) {
+    return 0;
+  }
+  /* Canonicalize any IPv4-in-IPv6 encoding first so e.g. ::ffff:169.254.169.254
+   * or a NAT64/6to4 form of a link-local address is classified too. */
+  ioa_addr embedded;
+  if (ioa_addr_get_embedded_ipv4(addr, &embedded)) {
+    addr = &embedded;
+  }
+  if (addr->ss.sa_family == AF_INET) {
+    const uint8_t *u = ((const uint8_t *)&(addr->s4.sin_addr));
+    /* IPv4 link-local 169.254.0.0/16 -- includes the 169.254.169.254 cloud
+     * metadata service, a classic SSRF target that is never a valid relay peer. */
+    if (u[0] == 169 && u[1] == 254) {
+      return 1;
+    }
+  } else if (addr->ss.sa_family == AF_INET6) {
+    const uint8_t *u = ((const uint8_t *)&(addr->s6.sin6_addr));
+    /* IPv6 link-local fe80::/10 */
+    if (u[0] == 0xfe && (u[1] & 0xc0) == 0x80) {
+      return 1;
+    }
+    /* IPv6 unique-local address (ULA) fc00::/7 -- fc00::/8 and fd00::/8 */
+    if ((u[0] & 0xfe) == 0xfc) {
+      return 1;
+    }
+    /* IPv6 site-local (deprecated, RFC 3879) fec0::/10 */
+    if (u[0] == 0xfe && (u[1] & 0xc0) == 0xc0) {
       return 1;
     }
   }
@@ -585,10 +675,10 @@ static size_t msz = 0;
 
 void ioa_addr_add_mapping(ioa_addr *apub, ioa_addr *apriv) {
   const size_t new_size = msz + sizeof(ioa_addr *);
-  public_addrs = (ioa_addr **)realloc(public_addrs, new_size);
-  private_addrs = (ioa_addr **)realloc(private_addrs, new_size);
-  public_addrs[mcount] = (ioa_addr *)malloc(sizeof(ioa_addr));
-  private_addrs[mcount] = (ioa_addr *)malloc(sizeof(ioa_addr));
+  public_addrs = (ioa_addr **)turn_realloc(public_addrs, new_size);
+  private_addrs = (ioa_addr **)turn_realloc(private_addrs, new_size);
+  public_addrs[mcount] = (ioa_addr *)turn_malloc(sizeof(ioa_addr));
+  private_addrs[mcount] = (ioa_addr *)turn_malloc(sizeof(ioa_addr));
   addr_cpy(public_addrs[mcount], apub);
   addr_cpy(private_addrs[mcount], apriv);
   ++mcount;

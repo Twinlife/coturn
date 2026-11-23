@@ -32,10 +32,15 @@
  * SUCH DAMAGE.
  */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "ns_turn_khash.h"
 #include "ns_turn_server.h"
 #include "ns_turn_session.h"
 #include "ns_turn_utils.h"
+#include <errno.h>
 
 #include "apputils.h"
 #include "stun_buffer.h"
@@ -61,6 +66,8 @@
 #include TURN_SCTP_INCLUDE
 #endif
 
+#include "dbdrivers/dbdriver.h"
+
 /* Compilation test:
 #if defined(IP_RECVTTL)
 #undef IP_RECVTTL
@@ -77,6 +84,36 @@
 */
 
 #define MAX_ERRORS_IN_UDP_BATCH (1024)
+#define MAX_SOCKET_RECVMMSG_BATCH IOA_UDP_RECVMMSG_MAX_BATCH
+
+#if defined(__linux__) && defined(CMSG_SPACE)
+#if defined(IP_RECVTTL) || defined(IP_TTL)
+#define SOCKET_RECVMMSG_IPV4_TTL_CMSG_SZ CMSG_SPACE(sizeof(int))
+#else
+#define SOCKET_RECVMMSG_IPV4_TTL_CMSG_SZ 0
+#endif
+#if defined(IP_RECVTOS) || defined(IP_TOS)
+#define SOCKET_RECVMMSG_IPV4_TOS_CMSG_SZ CMSG_SPACE(sizeof(int))
+#else
+#define SOCKET_RECVMMSG_IPV4_TOS_CMSG_SZ 0
+#endif
+#if defined(IPV6_RECVHOPLIMIT) || defined(IPV6_HOPLIMIT)
+#define SOCKET_RECVMMSG_IPV6_TTL_CMSG_SZ CMSG_SPACE(sizeof(int))
+#else
+#define SOCKET_RECVMMSG_IPV6_TTL_CMSG_SZ 0
+#endif
+#if defined(IPV6_RECVTCLASS) || defined(IPV6_TCLASS)
+#define SOCKET_RECVMMSG_IPV6_TOS_CMSG_SZ CMSG_SPACE(sizeof(int))
+#else
+#define SOCKET_RECVMMSG_IPV6_TOS_CMSG_SZ 0
+#endif
+#define SOCKET_RECVMMSG_IPV4_CMSG_SZ (SOCKET_RECVMMSG_IPV4_TTL_CMSG_SZ + SOCKET_RECVMMSG_IPV4_TOS_CMSG_SZ)
+#define SOCKET_RECVMMSG_IPV6_CMSG_SZ (SOCKET_RECVMMSG_IPV6_TTL_CMSG_SZ + SOCKET_RECVMMSG_IPV6_TOS_CMSG_SZ)
+#define SOCKET_RECVMMSG_CMSG_SZ                                                                                        \
+  ((SOCKET_RECVMMSG_IPV4_CMSG_SZ > SOCKET_RECVMMSG_IPV6_CMSG_SZ) ? SOCKET_RECVMMSG_IPV4_CMSG_SZ                        \
+                                                                 : SOCKET_RECVMMSG_IPV6_CMSG_SZ)
+#define SOCKET_RECVMMSG_CMSG_ALLOC_SZ ((SOCKET_RECVMMSG_CMSG_SZ) > 0 ? (SOCKET_RECVMMSG_CMSG_SZ) : 1)
+#endif
 
 struct turn_sock_extended_err {
   uint32_t ee_errno; /* error number */
@@ -89,7 +126,32 @@ struct turn_sock_extended_err {
   /* More data may follow */
 };
 
+#if defined(__linux__)
+struct ioa_socket_recvmmsg_state {
+  struct mmsghdr msgs[MAX_SOCKET_RECVMMSG_BATCH];
+  struct iovec iovecs[MAX_SOCKET_RECVMMSG_BATCH];
+  char cmsgs[MAX_SOCKET_RECVMMSG_BATCH][SOCKET_RECVMMSG_CMSG_ALLOC_SZ];
+  ioa_addr src_addrs[MAX_SOCKET_RECVMMSG_BATCH];
+  int ttls[MAX_SOCKET_RECVMMSG_BATCH];
+  int toss[MAX_SOCKET_RECVMMSG_BATCH];
+};
+#endif
+
 #define TRIAL_EFFORTS_TO_SEND (2)
+#define MAX_SENDMMSG_BATCH (32)
+#define MIN_SENDMMSG_BATCH (4)
+#define MIN_UDP_GSO_BATCH (2)
+#define MAX_UDP_GSO_DGRAM_SIZE (1472)
+
+#if defined(__linux__)
+#include <netinet/udp.h>
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+#ifndef SOL_UDP
+#define SOL_UDP 17
+#endif
+#endif
 
 #define SSL_MAX_RENEG_NUMBER (3)
 
@@ -110,6 +172,13 @@ static int send_ssl_backlog_buffers(ioa_socket_handle s);
 static int set_accept_cb(ioa_socket_handle s, accept_cb acb, void *arg);
 
 static void close_socket_net_data(ioa_socket_handle s);
+
+static void udp_sendmmsg_flush_before_socket_invalidation(ioa_socket_handle s);
+
+#if defined(__linux__)
+static int ensure_engine_recvmmsg_state(ioa_engine_handle e);
+static int socket_udp_read_batch_recvmmsg(ioa_socket_handle s, int *last_len);
+#endif
 
 /************** Utils **************************/
 
@@ -207,17 +276,17 @@ static void log_socket_event(ioa_socket_handle s, const char *msg, int error) {
     UNUSED_ARG(ll);
 
     {
-      char sraddr[129] = "\0";
-      char sladdr[129] = "\0";
-      addr_to_string(&(s->remote_addr), (uint8_t *)sraddr);
-      addr_to_string(&(s->local_addr), (uint8_t *)sladdr);
+      char sraddr[MAX_IOA_ADDR_STRING] = "";
+      char sladdr[MAX_IOA_ADDR_STRING] = "";
+      addr_to_string(&(s->remote_addr), sraddr);
+      addr_to_string(&(s->local_addr), sladdr);
 
       if (EVUTIL_SOCKET_ERROR()) {
-        TURN_LOG_FUNC(ll, "session %018llu: %s: %s (local %s, remote %s)\n", (unsigned long long)id, msg,
-                      evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()), sladdr, sraddr);
+        TURN_LOG_FUNC(ll, "socket event: %s: %s (local %s, remote %s) (session %018llu)\n", msg,
+                      evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()), sladdr, sraddr, (unsigned long long)id);
       } else {
-        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: %s (local %s, remote %s)\n", (unsigned long long)id, msg,
-                      sladdr, sraddr);
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "socket event: %s (local %s, remote %s) (session %018llu)\n", msg, sladdr,
+                      sraddr, (unsigned long long)id);
       }
     }
   }
@@ -308,7 +377,7 @@ static stun_buffer_list_elem *new_blist_elem(ioa_engine_handle e) {
   stun_buffer_list_elem *ret = get_elem_from_buffer_list(&(e->bufs));
 
   if (!ret) {
-    ret = (stun_buffer_list_elem *)malloc(sizeof(stun_buffer_list_elem));
+    ret = (stun_buffer_list_elem *)turn_malloc(sizeof(stun_buffer_list_elem));
   }
 
   if (ret) {
@@ -337,11 +406,7 @@ static inline void add_elem_to_buffer_list(stun_buffer_list *bufs, stun_buffer_l
 
 static void add_buffer_to_buffer_list(stun_buffer_list *bufs, char *buf, size_t len) {
   if (bufs && buf && (bufs->tsz < MAX_SOCKET_BUFFER_BACKLOG)) {
-    stun_buffer_list_elem *buf_elem = (stun_buffer_list_elem *)malloc(sizeof(stun_buffer_list_elem));
-    if (buf_elem == NULL) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: failure in call to calloc \n", __FUNCTION__);
-      return;
-    }
+    stun_buffer_list_elem *buf_elem = (stun_buffer_list_elem *)turn_malloc(sizeof(stun_buffer_list_elem));
     memcpy(buf_elem->buf.buf, buf, len);
     buf_elem->buf.len = len;
     buf_elem->buf.offset = 0;
@@ -360,16 +425,287 @@ static void free_blist_elem(ioa_engine_handle e, stun_buffer_list_elem *buf_elem
   }
 }
 
+#if !defined(_MSC_VER) && defined(CMSG_SPACE)
+void ioa_parse_udp_recvmsg_cmsg(struct msghdr *msg, int *ttl, int *tos, uint32_t *errcode) {
+
+  recv_ttl_t recv_ttl = TTL_DEFAULT;
+  recv_tos_t recv_tos = TOS_DEFAULT;
+  struct cmsghdr *cmsgh = NULL;
+
+  if (errcode) {
+    *errcode = 0;
+  }
+
+  for (cmsgh = CMSG_FIRSTHDR(msg); cmsgh != NULL; cmsgh = CMSG_NXTHDR(msg, cmsgh)) {
+    const int l = cmsgh->cmsg_level;
+    const int t = cmsgh->cmsg_type;
+
+    switch (l) {
+    case IPPROTO_IP:
+      switch (t) {
+#if defined(IP_RECVTTL) && !defined(__sparc_v9__)
+      case IP_RECVTTL:
+      case IP_TTL:
+        recv_ttl = *((recv_ttl_t *)CMSG_DATA(cmsgh));
+        break;
+#endif
+#if defined(IP_RECVTOS)
+      case IP_RECVTOS:
+      case IP_TOS:
+        recv_tos = *((recv_tos_t *)CMSG_DATA(cmsgh));
+        break;
+#endif
+#if defined(IP_RECVERR)
+      case IP_RECVERR: {
+        struct turn_sock_extended_err *e = (struct turn_sock_extended_err *)CMSG_DATA(cmsgh);
+        if (errcode) {
+          *errcode = e->ee_errno;
+        }
+      } break;
+#endif
+      default:;
+      };
+      break;
+    case IPPROTO_IPV6:
+      switch (t) {
+#if defined(IPV6_RECVHOPLIMIT) && !defined(__sparc_v9__)
+      case IPV6_RECVHOPLIMIT:
+      case IPV6_HOPLIMIT:
+        recv_ttl = *((recv_ttl_t *)CMSG_DATA(cmsgh));
+        break;
+#endif
+#if defined(IPV6_RECVTCLASS)
+      case IPV6_RECVTCLASS:
+      case IPV6_TCLASS:
+        recv_tos = *((recv_tos_t *)CMSG_DATA(cmsgh));
+        break;
+#endif
+#if defined(IPV6_RECVERR)
+      case IPV6_RECVERR: {
+        struct turn_sock_extended_err *e = (struct turn_sock_extended_err *)CMSG_DATA(cmsgh);
+        if (errcode) {
+          *errcode = e->ee_errno;
+        }
+      } break;
+#endif
+      default:;
+      };
+      break;
+    default:;
+    };
+  }
+
+  if (ttl) {
+    *ttl = recv_ttl;
+    CORRECT_RAW_TTL(*ttl);
+  }
+  if (tos) {
+    *tos = recv_tos;
+    CORRECT_RAW_TOS(*tos);
+  }
+}
+#endif
+
+#if defined(__linux__)
+void ioa_init_recvmmsg_hdr(struct mmsghdr *msg, struct iovec *iov, ioa_addr *src_addr, char *cmsg, size_t cmsg_len,
+                           socklen_t slen, void *buf, size_t len) {
+  if (!msg || !iov || !src_addr || !cmsg) {
+    return;
+  }
+
+  memset(msg, 0, sizeof(*msg));
+  memset(iov, 0, sizeof(*iov));
+
+  addr_set_any(src_addr);
+
+  iov->iov_base = buf;
+  iov->iov_len = len;
+
+  msg->msg_hdr.msg_name = src_addr;
+  msg->msg_hdr.msg_namelen = slen;
+  msg->msg_hdr.msg_iov = iov;
+  msg->msg_hdr.msg_iovlen = 1;
+  msg->msg_hdr.msg_control = cmsg;
+  msg->msg_hdr.msg_controllen = cmsg_len;
+  msg->msg_len = 0;
+}
+#endif
+
 /************** ENGINE *************************/
+
+void ioa_engine_record_packets(ioa_engine_handle e, uint32_t processed, uint32_t dropped) {
+  if (!e) {
+    return;
+  }
+  /* Lock-free: only ever touched by this engine's own relay thread. Flushed to
+   * the shared prometheus counters once per second by timer_handler. */
+  e->prom_packets_processed += processed;
+  e->prom_packets_dropped += dropped;
+}
+
+#if defined(__linux__)
+void ioa_engine_record_udp_recvmmsg_batch(ioa_engine_handle e, int rc) {
+  if (!e || rc <= 0) {
+    return;
+  }
+
+  unsigned int bucket = (unsigned int)rc;
+  if (bucket > IOA_UDP_RECVMMSG_MAX_BATCH) {
+    bucket = IOA_UDP_RECVMMSG_MAX_BATCH;
+  }
+
+  e->udp_recvmmsg_calls++;
+  e->udp_recvmmsg_packets += (uint64_t)rc;
+  e->udp_recvmmsg_hist[bucket]++;
+}
+
+void ioa_engine_record_udp_recvmmsg_wouldblock(ioa_engine_handle e) {
+  if (e) {
+    e->udp_recvmmsg_wouldblock++;
+  }
+}
+
+void ioa_engine_record_udp_recvmmsg_unavailable(ioa_engine_handle e) {
+  if (e) {
+    e->udp_recvmmsg_unavailable++;
+  }
+}
+
+void ioa_engine_record_udp_recvmmsg_no_buffer(ioa_engine_handle e) {
+  if (e) {
+    e->udp_recvmmsg_no_buffer++;
+  }
+}
+
+static void maybe_log_udp_recvmmsg_stats(ioa_engine_handle e, turn_time_t now) {
+  if (!turn_params.udp_recvmmsg_log || !e || (e->udp_recvmmsg_calls == e->udp_recvmmsg_last_report_calls) ||
+      ((now - e->udp_recvmmsg_last_report_time) < 10)) {
+    return;
+  }
+
+  e->udp_recvmmsg_last_report_calls = e->udp_recvmmsg_calls;
+  e->udp_recvmmsg_last_report_time = now;
+
+  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
+                "udp-recvmmsg stats: calls=%llu packets=%llu avg_batch=%.2f wouldblock=%llu unavailable=%llu "
+                "no_buffer=%llu hist_1=%llu hist_2=%llu hist_3_4=%llu hist_5_8=%llu hist_9_16=%llu\n",
+                (unsigned long long)e->udp_recvmmsg_calls, (unsigned long long)e->udp_recvmmsg_packets,
+                e->udp_recvmmsg_calls ? ((double)e->udp_recvmmsg_packets / (double)e->udp_recvmmsg_calls) : 0.0,
+                (unsigned long long)e->udp_recvmmsg_wouldblock, (unsigned long long)e->udp_recvmmsg_unavailable,
+                (unsigned long long)e->udp_recvmmsg_no_buffer, (unsigned long long)e->udp_recvmmsg_hist[1],
+                (unsigned long long)e->udp_recvmmsg_hist[2],
+                (unsigned long long)(e->udp_recvmmsg_hist[3] + e->udp_recvmmsg_hist[4]),
+                (unsigned long long)(e->udp_recvmmsg_hist[5] + e->udp_recvmmsg_hist[6] + e->udp_recvmmsg_hist[7] +
+                                     e->udp_recvmmsg_hist[8]),
+                (unsigned long long)(e->udp_recvmmsg_hist[9] + e->udp_recvmmsg_hist[10] + e->udp_recvmmsg_hist[11] +
+                                     e->udp_recvmmsg_hist[12] + e->udp_recvmmsg_hist[13] + e->udp_recvmmsg_hist[14] +
+                                     e->udp_recvmmsg_hist[15] + e->udp_recvmmsg_hist[16]));
+}
+
+void ioa_engine_record_udp_sendmmsg_flush(ioa_engine_handle e, unsigned int count, unsigned int gso_count) {
+  if (!e || count == 0) {
+    return;
+  }
+
+  unsigned int bucket = count;
+  if (bucket > IOA_UDP_SENDMMSG_MAX_BATCH) {
+    bucket = IOA_UDP_SENDMMSG_MAX_BATCH;
+  }
+
+  e->udp_sendmmsg_flushes++;
+  e->udp_sendmmsg_datagrams += (uint64_t)count;
+  e->udp_sendmmsg_hist[bucket]++;
+
+  if (gso_count > 0) {
+    e->udp_sendmmsg_gso_flushes++;
+    e->udp_sendmmsg_gso_datagrams += (uint64_t)gso_count;
+  }
+}
+
+static uint64_t udp_sendmmsg_hist_sum(const ioa_engine_handle e, unsigned int lo, unsigned int hi) {
+  uint64_t s = 0;
+  for (unsigned int i = lo; i <= hi && i <= IOA_UDP_SENDMMSG_MAX_BATCH; ++i) {
+    s += e->udp_sendmmsg_hist[i];
+  }
+  return s;
+}
+
+static void maybe_log_udp_sendmmsg_stats(ioa_engine_handle e, turn_time_t now) {
+  if (!turn_params.udp_sendmmsg_log || !e || (e->udp_sendmmsg_flushes == e->udp_sendmmsg_last_report_flushes) ||
+      ((now - e->udp_sendmmsg_last_report_time) < 10)) {
+    return;
+  }
+
+  e->udp_sendmmsg_last_report_flushes = e->udp_sendmmsg_flushes;
+  e->udp_sendmmsg_last_report_time = now;
+
+  const double avg_batch =
+      e->udp_sendmmsg_flushes ? ((double)e->udp_sendmmsg_datagrams / (double)e->udp_sendmmsg_flushes) : 0.0;
+  const double gso_frac =
+      e->udp_sendmmsg_datagrams ? ((double)e->udp_sendmmsg_gso_datagrams / (double)e->udp_sendmmsg_datagrams) : 0.0;
+
+  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
+                "udp-sendmmsg stats: flushes=%llu datagrams=%llu avg_batch=%.2f gso_flushes=%llu gso_datagrams=%llu "
+                "gso_frac=%.3f hist_1=%llu hist_2=%llu hist_3_4=%llu hist_5_8=%llu hist_9_16=%llu hist_17_32=%llu\n",
+                (unsigned long long)e->udp_sendmmsg_flushes, (unsigned long long)e->udp_sendmmsg_datagrams, avg_batch,
+                (unsigned long long)e->udp_sendmmsg_gso_flushes, (unsigned long long)e->udp_sendmmsg_gso_datagrams,
+                gso_frac, (unsigned long long)e->udp_sendmmsg_hist[1], (unsigned long long)e->udp_sendmmsg_hist[2],
+                (unsigned long long)udp_sendmmsg_hist_sum(e, 3, 4), (unsigned long long)udp_sendmmsg_hist_sum(e, 5, 8),
+                (unsigned long long)udp_sendmmsg_hist_sum(e, 9, 16),
+                (unsigned long long)udp_sendmmsg_hist_sum(e, 17, 32));
+}
+#endif
+
+/* Flush this engine's lock-free per-thread counters into the shared prometheus
+ * counters as deltas. Called once per second from timer_handler so the global
+ * prom_counter locks are hit ~1x/sec/thread instead of per batch. */
+static void maybe_flush_prom_counters(ioa_engine_handle e) {
+  if (!turn_params.prometheus || !e) {
+    return;
+  }
+
+  struct prom_udp_counter_deltas d = {0};
+
+  d.packets_processed = e->prom_packets_processed - e->prom_packets_processed_flushed;
+  d.packets_dropped = e->prom_packets_dropped - e->prom_packets_dropped_flushed;
+  e->prom_packets_processed_flushed = e->prom_packets_processed;
+  e->prom_packets_dropped_flushed = e->prom_packets_dropped;
+
+#if defined(__linux__)
+  d.recvmmsg_calls = e->udp_recvmmsg_calls - e->udp_recvmmsg_calls_prom_flushed;
+  d.recvmmsg_packets = e->udp_recvmmsg_packets - e->udp_recvmmsg_packets_prom_flushed;
+  d.sendmmsg_flushes = e->udp_sendmmsg_flushes - e->udp_sendmmsg_flushes_prom_flushed;
+  d.sendmmsg_datagrams = e->udp_sendmmsg_datagrams - e->udp_sendmmsg_datagrams_prom_flushed;
+  d.sendmmsg_gso_datagrams = e->udp_sendmmsg_gso_datagrams - e->udp_sendmmsg_gso_datagrams_prom_flushed;
+  e->udp_recvmmsg_calls_prom_flushed = e->udp_recvmmsg_calls;
+  e->udp_recvmmsg_packets_prom_flushed = e->udp_recvmmsg_packets;
+  e->udp_sendmmsg_flushes_prom_flushed = e->udp_sendmmsg_flushes;
+  e->udp_sendmmsg_datagrams_prom_flushed = e->udp_sendmmsg_datagrams;
+  e->udp_sendmmsg_gso_datagrams_prom_flushed = e->udp_sendmmsg_gso_datagrams;
+#endif
+
+  prom_flush_udp_counters(&d);
+
+  /* Same once-per-second-per-thread flush for the 401 mitigation counters,
+   * which accumulate lock-free in _Thread_local storage on the relay hot path. */
+  prom_flush_401_counters();
+}
 
 static void timer_handler(ioa_engine_handle e, void *arg) {
 
   UNUSED_ARG(arg);
 
-  _log_time_value = turn_time();
-  _log_time_value_set = 1;
+  const turn_time_t now = turn_time();
+  turn_atomic_store_u32(&_log_time_value, now);
 
-  e->jiffie = _log_time_value;
+  e->jiffie = now;
+
+  maybe_flush_prom_counters(e);
+
+#if defined(__linux__)
+  maybe_log_udp_recvmmsg_stats(e, now);
+  maybe_log_udp_sendmmsg_stats(e, now);
+#endif
 }
 
 ioa_engine_handle create_ioa_engine(super_memory_t *sm, struct event_base *eb, turnipports *tp,
@@ -586,11 +922,7 @@ ioa_timer_handle set_ioa_timer(ioa_engine_handle e, int secs, int ms, ioa_timer_
 
   if (e && cb && secs > 0) {
 
-    timer_event *te = (timer_event *)malloc(sizeof(timer_event));
-    if (te == NULL) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: failure in call to calloc \n", __FUNCTION__);
-      return NULL;
-    }
+    timer_event *te = (timer_event *)turn_malloc(sizeof(timer_event));
 
     int flags = EV_TIMEOUT;
     if (persist) {
@@ -606,7 +938,7 @@ ioa_timer_handle set_ioa_timer(ioa_engine_handle e, int secs, int ms, ioa_timer_
       te->e = e;
       te->ev = ev;
       te->cb = cb;
-      te->txt = strdup(txt);
+      te->txt = turn_strdup(txt);
     }
 
     if (!ms) {
@@ -733,6 +1065,12 @@ int get_ioa_socket_from_reservation(ioa_engine_handle e, uint64_t in_reservation
 /* Socket options helpers ==>> */
 
 static int set_socket_ttl(ioa_socket_handle s, int ttl) {
+  /* A child shares its parent's fd, so the parent holds the one cache that
+   * matches the kernel value; a per-child cache goes stale for everyone else. */
+  if (s->parent_s) {
+    s = s->parent_s;
+  }
+
   if (s->default_ttl < 0) { // Unsupported
     return -1;
   }
@@ -747,6 +1085,12 @@ static int set_socket_ttl(ioa_socket_handle s, int ttl) {
     ttl = s->default_ttl;
   }
 
+  /* Linux rejects IP_TTL outside 1..255; a relayed packet that arrived with
+   * TTL 1 would otherwise ask for 0. */
+  if (ttl < 1) {
+    ttl = 1;
+  }
+
   if (s->current_ttl != ttl) {
     const int ret = set_raw_socket_ttl(s->fd, s->family, ttl);
     s->current_ttl = ttl;
@@ -757,6 +1101,10 @@ static int set_socket_ttl(ioa_socket_handle s, int ttl) {
 }
 
 static int set_socket_tos(ioa_socket_handle s, int tos) {
+  if (s->parent_s) {
+    s = s->parent_s;
+  }
+
   if (s->default_tos < 0) { // Unsupported
     return -1;
   }
@@ -783,7 +1131,7 @@ int set_raw_socket_ttl_options(evutil_socket_t fd, int family) {
 #else
     int recv_ttl_on = 1;
     if (setsockopt(fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, (const void *)&recv_ttl_on, sizeof(recv_ttl_on)) < 0) {
-      perror("cannot set recvhoplimit\n");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "cannot set recvhoplimit: %s\n", strerror(errno));
     }
 #endif
   } else {
@@ -792,7 +1140,7 @@ int set_raw_socket_ttl_options(evutil_socket_t fd, int family) {
 #else
     int recv_ttl_on = 1;
     if (setsockopt(fd, IPPROTO_IP, IP_RECVTTL, (const void *)&recv_ttl_on, sizeof(recv_ttl_on)) < 0) {
-      perror("cannot set recvttl\n");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "cannot set recvttl: %s\n", strerror(errno));
     }
 #endif
   }
@@ -807,7 +1155,7 @@ int set_raw_socket_tos_options(evutil_socket_t fd, int family) {
 #else
     int recv_tos_on = 1;
     if (setsockopt(fd, IPPROTO_IPV6, IPV6_RECVTCLASS, (const void *)&recv_tos_on, sizeof(recv_tos_on)) < 0) {
-      perror("cannot set recvtclass\n");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "cannot set recvtclass: %s\n", strerror(errno));
     }
 #endif
   } else {
@@ -816,7 +1164,7 @@ int set_raw_socket_tos_options(evutil_socket_t fd, int family) {
 #else
     int recv_tos_on = 1;
     if (setsockopt(fd, IPPROTO_IP, IP_RECVTOS, (const void *)&recv_tos_on, sizeof(recv_tos_on)) < 0) {
-      perror("cannot set recvtos\n");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "cannot set recvtos: %s\n", strerror(errno));
     }
 #endif
   }
@@ -836,7 +1184,7 @@ int set_socket_options_fd(evutil_socket_t fd, SOCKET_TYPE st, int family) {
     so_linger.l_onoff = 1;
     so_linger.l_linger = 0;
     if (setsockopt(fd, SOL_SOCKET, SO_LINGER, (const void *)&so_linger, sizeof(so_linger)) < 1) {
-      // perror("setsolinger")
+      // TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "setsolinger: %s\n", strerror(errno))
       ;
     }
   }
@@ -854,7 +1202,7 @@ int set_socket_options_fd(evutil_socket_t fd, SOCKET_TYPE st, int family) {
       on = 1;
 #endif
       if (setsockopt(fd, IPPROTO_IP, IP_RECVERR, (const void *)&on, sizeof(on)) < 0) {
-        perror("IP_RECVERR");
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "IP_RECVERR: %s\n", strerror(errno));
       }
     }
 #endif
@@ -866,7 +1214,7 @@ int set_socket_options_fd(evutil_socket_t fd, SOCKET_TYPE st, int family) {
       on = 1;
 #endif
       if (setsockopt(fd, IPPROTO_IPV6, IPV6_RECVERR, (const void *)&on, sizeof(on)) < 0) {
-        perror("IPV6_RECVERR");
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "IPV6_RECVERR: %s\n", strerror(errno));
       }
     }
 #endif
@@ -924,14 +1272,14 @@ ioa_socket_handle create_unbound_relay_ioa_socket(ioa_engine_handle e, int famil
   case UDP_SOCKET:
     fd = socket(family, RELAY_DGRAM_SOCKET_TYPE, RELAY_DGRAM_SOCKET_PROTOCOL);
     if (fd < 0) {
-      perror("UDP socket");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "UDP socket: %s\n", strerror(errno));
       return NULL;
     }
     break;
   case TCP_SOCKET:
     fd = socket(family, RELAY_STREAM_SOCKET_TYPE, RELAY_STREAM_SOCKET_PROTOCOL);
     if (fd < 0) {
-      perror("TCP socket");
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "TCP socket: %s\n", strerror(errno));
       return NULL;
     }
     break;
@@ -940,12 +1288,7 @@ ioa_socket_handle create_unbound_relay_ioa_socket(ioa_engine_handle e, int famil
     return NULL;
   }
 
-  ret = (ioa_socket *)calloc(1, sizeof(ioa_socket));
-
-  if (ret == NULL) {
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: failure in call to calloc \n", __FUNCTION__);
-    return NULL;
-  }
+  ret = (ioa_socket *)turn_calloc(1, sizeof(ioa_socket));
 
   ret->magic = SOCKET_MAGIC;
 
@@ -953,6 +1296,11 @@ ioa_socket_handle create_unbound_relay_ioa_socket(ioa_engine_handle e, int famil
   ret->family = family;
   ret->st = st;
   ret->sat = sat;
+  if (sat == LISTENER_SOCKET) {
+    /* The client listener is a shared fan-in socket: it receives datagrams from
+     * many clients per wakeup, so it benefits from recvmmsg batching. */
+    ret->udp_recvmmsg_eligible = true;
+  }
   ret->e = e;
 
   set_socket_options(ret);
@@ -971,7 +1319,7 @@ static int bind_ioa_socket(ioa_socket_handle s, const ioa_addr *local_addr, int 
     if (res >= 0) {
       s->bound = 1;
       addr_cpy(&(s->local_addr), local_addr);
-      if (addr_get_port(local_addr) < 1) {
+      if (addr_get_port(local_addr) == 0) {
         ioa_addr tmpaddr;
         addr_get_from_sock(s->fd, &tmpaddr);
         if (addr_any(&(s->local_addr))) {
@@ -987,10 +1335,259 @@ static int bind_ioa_socket(ioa_socket_handle s, const ioa_addr *local_addr, int 
   return -1;
 }
 
+/* ======================================================================
+ * MULTIPLEX-PEER IMPLEMENTATION
+ * ====================================================================== */
+
+/*
+ * UDP receive callback for the thread-local shared relay socket.
+ *
+ * Packets arriving here come from peers. Multiplex-peer assumes each peer
+ * IP:port belongs to one client allocation, so the exact peer endpoint is
+ * the routing key.
+ */
+static void mp_relay_input_handler(ioa_socket_handle s, int event_type, ioa_net_data *data, void *ctx, int can_resume) {
+  ioa_engine_handle e = (ioa_engine_handle)ctx;
+  if (!e || !data) {
+    return;
+  }
+
+  ts_ur_super_session *ss = (ts_ur_super_session *)mp_peer_table_lookup(&e->mp_table, &data->src_addr);
+  if (!ss || ss->to_be_closed) {
+    return;
+  }
+
+  allocation *a = get_allocation_ss(ss);
+  if (!is_allocation_valid(a)) {
+    return;
+  }
+
+  turn_turnserver *server = (turn_turnserver *)ss->server;
+  if ((!server || !server->server_relay) && !allocation_get_permission(a, &data->src_addr)) {
+    return;
+  }
+
+  turn_peer_input_handler(s, event_type, data, ss, can_resume);
+}
+
+/*
+ * Open a single UDP socket bound to relay_addr:port, optionally set
+ * SO_REUSEPORT, register mp_relay_input_handler, and store the handle in
+ * *sock_out. The REUSEPORT call is defensive (per-thread base+2i ports are
+ * already unique, so no two threads ever try to share); skipping it on
+ * platforms that don't define SO_REUSEPORT (Windows) is harmless.
+ */
+static int mp_open_socket(ioa_engine_handle e, const char *relay_addr, int af, uint16_t port,
+                          ioa_socket_handle *sock_out) {
+  ioa_addr addr = {0};
+  if (make_ioa_addr((const uint8_t *)relay_addr, port, &addr) != 0) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "multiplex-peer: cannot parse relay addr '%s'\n", relay_addr);
+    return -1;
+  }
+
+  ioa_socket_handle s = create_unbound_relay_ioa_socket(e, af, UDP_SOCKET, RELAY_SOCKET);
+  if (!s) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "multiplex-peer: socket() failed for %s:%u\n", relay_addr, (unsigned)port);
+    return -1;
+  }
+
+#if defined(SO_REUSEPORT)
+  int opt = 1;
+  setsockopt(s->fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+
+  if (bind_ioa_socket(s, &addr, /*is_tcp=*/0) < 0) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "multiplex-peer: bind() failed for %s:%u\n", relay_addr, (unsigned)port);
+    IOA_CLOSE_SOCKET(s);
+    return -1;
+  }
+
+  /* Size the shared relay socket per --sock-buf-size at startup. The
+   * legacy per-allocation path applies this after each Allocate, but the
+   * shared multiplex-peer socket would otherwise run with the kernel's
+   * UDP rcvbuf default until the first allocate landed — and since the
+   * socket carries every session on the thread, an undersized rcvbuf
+   * here drops more inbound traffic at UdpRcvbufErrors than a single
+   * legacy relay socket ever would. */
+  set_ioa_socket_buf_size(s, turn_params.sock_buf_size);
+
+  sock_bind_to_device(s->fd, (unsigned char *)e->relay_ifname);
+
+  register_callback_on_ioa_socket(e, s, IOA_EV_READ, mp_relay_input_handler, (void *)e, /*clean_preexisting=*/0);
+
+  *sock_out = s;
+  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "multiplex-peer: thread %d %s socket bound to %s:%u\n", e->relay_thread_id,
+                af == AF_INET ? "IPv4" : "IPv6", relay_addr, (unsigned)port);
+  return 0;
+}
+
+/* Called once per relay thread from setup_relay_server(). */
+int init_multiplex_peer(ioa_engine_handle e, int thread_id, uint16_t base_port, size_t max_peers_per_session) {
+  if (!e) {
+    return -1;
+  }
+
+  mp_peer_table_init(&e->mp_table, max_peers_per_session);
+  e->relay_thread_id = thread_id;
+
+  /*
+   * Port formula (no two threads clash):
+   *   IPv4 = base_port + thread_id * 2
+   *   IPv6 = base_port + thread_id * 2 + 1
+   */
+  const uint32_t port_v4_calc = (uint32_t)base_port + (uint32_t)thread_id * 2u;
+  const uint32_t port_v6_calc = port_v4_calc + 1u;
+  if (port_v6_calc > UINT16_MAX) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "multiplex-peer: calculated port range exceeds 65535\n");
+    return -1;
+  }
+
+  const uint16_t port_v4 = (uint16_t)port_v4_calc;
+  const uint16_t port_v6 = (uint16_t)port_v6_calc;
+
+  e->mp_port_v4 = port_v4;
+  e->mp_port_v6 = port_v6;
+
+  for (size_t i = 0; i < e->relays_number; i++) {
+    char ra_str[MAX_IOA_ADDR_STRING] = {0};
+    addr_to_string_no_port(&e->relay_addrs[i], ra_str);
+    int af = e->relay_addrs[i].ss.sa_family;
+
+    if (af == AF_INET && !e->mp_sock_v4) {
+      mp_open_socket(e, ra_str, AF_INET, port_v4, &e->mp_sock_v4);
+    } else if (af == AF_INET6 && !e->mp_sock_v6) {
+      mp_open_socket(e, ra_str, AF_INET6, port_v6, &e->mp_sock_v6);
+    }
+  }
+
+  if (!e->mp_sock_v4 && !e->mp_sock_v6) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
+                  "multiplex-peer: thread %d: no sockets opened – "
+                  "check --relay-ip configuration\n",
+                  thread_id);
+    return -1;
+  }
+
+  /* The per-thread multiplex-peer relay sockets receive peer datagrams for every
+   * session on the thread, so they are the relay-side sockets where recvmmsg
+   * batching pays off. Mark them eligible here, once, rather than re-deriving it
+   * on every read in socket_input_worker(). */
+  if (e->mp_sock_v4) {
+    e->mp_sock_v4->udp_recvmmsg_eligible = true;
+  }
+  if (e->mp_sock_v6) {
+    e->mp_sock_v6->udp_recvmmsg_eligible = true;
+  }
+
+  e->mp_enabled = 1;
+  return 0;
+}
+
+int mp_register_peer(ioa_engine_handle e, const ioa_addr *peer_addr, void *turn_session) {
+  if (!e || !peer_addr || !turn_session) {
+    return MP_REGISTER_CONFLICT;
+  }
+
+  if (addr_get_port(peer_addr) == 0) {
+    return MP_REGISTER_OK;
+  }
+
+  return mp_peer_table_register(&e->mp_table, peer_addr, turn_session);
+}
+
+void mp_deregister_peer(ioa_engine_handle e, const ioa_addr *peer_addr, void *turn_session) {
+  if (!e) {
+    return;
+  }
+  mp_peer_table_deregister(&e->mp_table, peer_addr, turn_session);
+}
+
+void mp_deregister_permission_peers(ioa_engine_handle e, const ioa_addr *peer_addr, void *turn_session) {
+  if (!e) {
+    return;
+  }
+  mp_peer_table_deregister_ip(&e->mp_table, peer_addr, turn_session);
+}
+
+void mp_deregister_session_peers(ioa_engine_handle e, void *turn_session, int address_family) {
+  if (!e) {
+    return;
+  }
+  mp_peer_table_deregister_session(&e->mp_table, turn_session, address_family);
+}
+
+ioa_socket_handle mp_get_socket(ioa_engine_handle e, int af) {
+  if (!e || !e->mp_enabled) {
+    return NULL;
+  }
+  return (af == AF_INET6) ? e->mp_sock_v6 : e->mp_sock_v4;
+}
+
+uint16_t mp_get_port(ioa_engine_handle e, int af) {
+  if (!e || !e->mp_enabled) {
+    return 0;
+  }
+  return (af == AF_INET6) ? e->mp_port_v6 : e->mp_port_v4;
+}
+
+/*
+ * Multiplex-peer allocation path.
+ * Called from create_relay_ioa_sockets() when multiplex_peer_mode is set.
+ */
+static int create_relay_socket_multiplex_peer(ioa_engine_handle e, ioa_socket_handle client_s, int address_family,
+                                              ioa_socket_handle *rtp_s, int *err_code, const uint8_t **reason) {
+  int family;
+  switch (address_family) {
+  case STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_IPV6:
+    family = AF_INET6;
+    break;
+  case STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_DEFAULT:
+    family = (e->default_relays && get_ioa_socket_address_family(client_s) == AF_INET6) ? AF_INET6 : AF_INET;
+    break;
+  default:
+    family = AF_INET;
+    break;
+  }
+  ioa_socket_handle shared = mp_get_socket(e, family);
+  if (!shared) {
+    *err_code = 508;
+    *reason = (const uint8_t *)"No multiplex-peer socket for requested address family";
+    return -1;
+  }
+
+  *rtp_s = shared;
+  return 0;
+}
+
+/* ======================================================================
+ * END MULTIPLEX-PEER IMPLEMENTATION
+ * ====================================================================== */
+
 int create_relay_ioa_sockets(ioa_engine_handle e, ioa_socket_handle client_s, int address_family, uint8_t transport,
                              int even_port, ioa_socket_handle *rtp_s, ioa_socket_handle *rtcp_s,
                              uint64_t *out_reservation_token, int *err_code, const uint8_t **reason, accept_cb acb,
-                             void *acbarg) {
+                             void *acbarg, bool multiplex_peer_mode) {
+  if (multiplex_peer_mode && transport == STUN_ATTRIBUTE_TRANSPORT_UDP_VALUE) {
+    if (even_port >= 0) {
+      /* RFC 8656 par. 7.2: the request is well-formed but this configuration
+       * cannot satisfy it, so 508 (Insufficient Capacity), not 400. */
+      if (err_code) {
+        *err_code = 508;
+      }
+      if (reason) {
+        *reason = (const uint8_t *)"EVEN-PORT is not supported with multiplex-peer";
+      }
+      return -1;
+    }
+    if (rtcp_s) {
+      *rtcp_s = NULL;
+    }
+    if (out_reservation_token) {
+      *out_reservation_token = 0;
+    }
+    return create_relay_socket_multiplex_peer(e, client_s, address_family, rtp_s, err_code, reason);
+  }
+  /* original code unchanged below */
 
   *rtp_s = NULL;
   if (rtcp_s) {
@@ -1042,7 +1639,7 @@ int create_relay_ioa_sockets(ioa_engine_handle e, ioa_socket_handle client_s, in
           }
           *rtcp_s = create_unbound_relay_ioa_socket(e, relay_addr.ss.sa_family, UDP_SOCKET, RELAY_RTCP_SOCKET);
           if (*rtcp_s == NULL) {
-            perror("socket");
+            TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "socket: %s\n", strerror(errno));
             IOA_CLOSE_SOCKET(*rtp_s);
             addr_set_port(&local_addr, port);
             turnipports_release(tp, transport, &local_addr);
@@ -1091,7 +1688,7 @@ int create_relay_ioa_sockets(ioa_engine_handle e, ioa_socket_handle client_s, in
             addr_set_port(&rtcp_local_addr, rtcp_port);
             turnipports_release(tp, transport, &rtcp_local_addr);
           }
-          perror("socket");
+          TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "socket: %s\n", strerror(errno));
           return -1;
         }
 
@@ -1293,7 +1890,7 @@ ccs_end:
    */
   s->fd = socket(s->family, RELAY_STREAM_SOCKET_TYPE, RELAY_STREAM_SOCKET_PROTOCOL);
   if (s->fd < 0) {
-    perror("TCP socket");
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "TCP socket: %s\n", strerror(errno));
     if (ret) {
       set_ioa_socket_session(ret, NULL);
       IOA_CLOSE_SOCKET(ret);
@@ -1361,17 +1958,17 @@ ioa_socket_handle create_ioa_socket_from_fd(ioa_engine_handle e, ioa_socket_raw 
     return NULL;
   }
 
-  ret = (ioa_socket *)calloc(1, sizeof(ioa_socket));
-
-  if (ret == NULL) {
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: failure in call to calloc \n", __FUNCTION__);
-    return NULL;
-  }
+  ret = (ioa_socket *)turn_calloc(1, sizeof(ioa_socket));
 
   ret->magic = SOCKET_MAGIC;
   ret->fd = fd;
   ret->st = st;
   ret->sat = sat;
+  if (sat == LISTENER_SOCKET) {
+    /* The client listener is a shared fan-in socket: it receives datagrams from
+     * many clients per wakeup, so it benefits from recvmmsg batching. */
+    ret->udp_recvmmsg_eligible = true;
+  }
   ret->e = e;
 
   if (local_addr) {
@@ -1390,6 +1987,13 @@ ioa_socket_handle create_ioa_socket_from_fd(ioa_engine_handle e, ioa_socket_raw 
 
   if (parent_s) {
     add_socket_to_parent(parent_s, ret);
+    /* This socket shares the parent's fd, so IP_TTL/TOS is the same kernel-level
+     * socket option: inherit the parent's known state instead of leaving these
+     * zero-initialized, which floors every outgoing TTL to 1 (see set_socket_ttl). */
+    ret->default_ttl = parent_s->default_ttl;
+    ret->current_ttl = parent_s->current_ttl;
+    ret->default_tos = parent_s->default_tos;
+    ret->current_tos = parent_s->current_tos;
   } else {
     set_socket_options(ret);
   }
@@ -1447,7 +2051,6 @@ ioa_socket_handle create_ioa_socket_from_ssl(ioa_engine_handle e, ioa_socket_han
 
 static void close_socket_net_data(ioa_socket_handle s) {
   if (s) {
-
     EVENT_DEL(s->read_event);
     if (s->list_ev) {
       evconnlistener_free(s->list_ev);
@@ -1519,7 +2122,20 @@ void close_ioa_socket(ioa_socket_handle s) {
       return;
     }
 
+    /* Drain the thread-local sendmmsg/GSO batch while this socket and its
+     * descriptor are still valid: a deferred flush would otherwise dereference
+     * freed memory or write to a closed (possibly reused) fd. */
+    udp_sendmmsg_flush_before_socket_invalidation(s);
+
     s->done = 1;
+
+    /* Release the DTLS half-open slot if this socket's handshake never finished.
+     * Idempotent via the flag; a completed handshake already cleared it in the
+     * listener's data path. */
+    if (s->dtls_half_open) {
+      s->dtls_half_open = false;
+      turn_dtls_half_open_dec(&(s->remote_addr));
+    }
 
     while (!buffer_list_empty(&(s->bufs))) {
       pop_elem_from_buffer_list(&(s->bufs));
@@ -1565,28 +2181,31 @@ ioa_socket_handle detach_ioa_socket(ioa_socket_handle s) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Detaching NULL socket\n");
   } else {
     if ((s->magic != SOCKET_MAGIC) || (s->done)) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "!!! %s detach on bad socket: %p, st=%d, sat=%d\n", __FUNCTION__, s, s->st,
-                    s->sat);
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "!!! %s socket: %p was closed\n", __FUNCTION__, s);
-      return ret;
-    }
-    if (s->tobeclosed) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "!!! %s detach on tobeclosed socket: %p, st=%d, sat=%d\n", __FUNCTION__, s,
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s detach on bad socket: %p, st=%d, sat=%d. Closed.\n", __FUNCTION__, s,
                     s->st, s->sat);
       return ret;
     }
-    if (!(s->e)) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "!!! %s detach on socket without engine: %p, st=%d, sat=%d\n", __FUNCTION__,
-                    s, s->st, s->sat);
+    if (s->tobeclosed) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s detach on tobeclosed socket: %p, st=%d, sat=%d\n", __FUNCTION__, s, s->st,
+                    s->sat);
       return ret;
     }
+    if (!(s->e)) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s detach on socket without engine: %p, st=%d, sat=%d\n", __FUNCTION__, s,
+                    s->st, s->sat);
+      return ret;
+    }
+
+    /* Detaching clears s->fd and s->parent_s, so any queued datagram would be
+     * flushed to a descriptor this socket no longer owns. */
+    udp_sendmmsg_flush_before_socket_invalidation(s);
 
     s->tobeclosed = 1;
 
     if (s->parent_s) {
       if ((s->st != UDP_SOCKET) && (s->st != DTLS_SOCKET)) {
-        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "!!! %s detach on non-UDP child socket: %p, st=%d, sat=%d\n", __FUNCTION__,
-                      s, s->st, s->sat);
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s detach on non-UDP child socket: %p, st=%d, sat=%d\n", __FUNCTION__, s,
+                      s->st, s->sat);
         return ret;
       }
     }
@@ -1596,8 +2215,8 @@ ioa_socket_handle detach_ioa_socket(ioa_socket_handle s) {
     if (s->parent_s) {
       udp_fd = socket(s->local_addr.ss.sa_family, CLIENT_DGRAM_SOCKET_TYPE, CLIENT_DGRAM_SOCKET_PROTOCOL);
       if (udp_fd < 0) {
-        perror("socket");
-        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: Cannot allocate new socket\n", __FUNCTION__);
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: Cannot allocate new socket. Error: %s\n", __FUNCTION__,
+                      strerror(errno));
         return ret;
       }
       if (sock_bind_to_device(udp_fd, (unsigned char *)(s->e->relay_ifname)) < 0) {
@@ -1629,7 +2248,7 @@ ioa_socket_handle detach_ioa_socket(ioa_socket_handle s) {
 
     ioa_network_buffer_delete(s->e, s->defer_nbh);
 
-    ret = (ioa_socket *)calloc(1, sizeof(ioa_socket));
+    ret = (ioa_socket *)turn_calloc(1, sizeof(ioa_socket));
     if (!ret) {
       TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: Cannot allocate new socket structure\n", __FUNCTION__);
       if (udp_fd >= 0) {
@@ -1661,17 +2280,16 @@ ioa_socket_handle detach_ioa_socket(ioa_socket_handle s) {
     delete_socket_from_parent(s);
 
     if (udp_fd >= 0) {
-
       ret->fd = udp_fd;
-
+      /* New fd: trust set_socket_options; do not copy a stale child TTL/TOS cache. */
       set_socket_options(ret);
+    } else {
+      /* Same fd: keep the existing TTL/TOS cache. */
+      ret->current_ttl = s->current_ttl;
+      ret->default_ttl = s->default_ttl;
+      ret->current_tos = s->current_tos;
+      ret->default_tos = s->default_tos;
     }
-
-    ret->current_ttl = s->current_ttl;
-    ret->default_ttl = s->default_ttl;
-
-    ret->current_tos = s->current_tos;
-    ret->default_tos = s->default_tos;
 
     s->fd = -1;
   }
@@ -1756,13 +2374,13 @@ ioa_addr *get_local_addr_from_ioa_socket(ioa_socket_handle s) {
 
     if (s->local_addr_known) {
       return &(s->local_addr);
-    } else if (s->bound && (addr_get_port(&(s->local_addr)) > 0)) {
+    } else if (s->bound && (addr_get_port(&(s->local_addr)) != 0)) {
       s->local_addr_known = 1;
       return &(s->local_addr);
     } else {
       ioa_addr tmpaddr;
       if (addr_get_from_sock(s->fd, &tmpaddr) == 0) {
-        if (addr_get_port(&tmpaddr) > 0) {
+        if (addr_get_port(&tmpaddr) != 0) {
           s->local_addr_known = 1;
           s->bound = 1;
           if (addr_any(&(s->local_addr))) {
@@ -1805,10 +2423,7 @@ int get_local_mtu_ioa_socket(ioa_socket_handle s) {
   return -1;
 }
 
-/*
- * Return: -1 - error, 0 or >0 - OK
- * *read_len -1 - no data, >=0 - data available
- */
+/* Return: -1 error, 0 no application data, >0 decrypted length. */
 int ssl_read(evutil_socket_t fd, SSL *ssl, ioa_network_buffer_handle nbh, int verbose) {
   int ret = 0;
 
@@ -1919,9 +2534,12 @@ int ssl_read(evutil_socket_t fd, SSL *ssl, ioa_network_buffer_handle nbh, int ve
       case SSL_ERROR_SSL:
         if (verbose) {
           TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "SSL read error: ");
-          char buf[65536];
-          TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s (%d)\n", ERR_error_string(ERR_get_error(), buf),
-                        SSL_get_error(ssl, len));
+          /* ERR_error_string() demands a caller buffer of at least 256 bytes; the
+           * _n form takes the size and truncates instead. */
+          const int ssl_err = SSL_get_error(ssl, len);
+          char errstr[256] = {0};
+          ERR_error_string_n(ERR_get_error(), errstr, sizeof(errstr));
+          TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s (%d)\n", errstr, ssl_err);
         }
         if (verbose) {
           TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "SSL connection closed.\n");
@@ -1939,6 +2557,9 @@ int ssl_read(evutil_socket_t fd, SSL *ssl, ioa_network_buffer_handle nbh, int ve
 
   if (ret > 0) {
     ioa_network_buffer_add_offset_size(nbh, (uint16_t)buf_size, 0, (size_t)ret);
+  } else {
+    /* Callers treat size>0 as TURN input; clear so undecrypted bytes are ignored. */
+    ioa_network_buffer_set_size(nbh, 0);
   }
 #if defined LIBRESSL_VERSION_NUMBER && LIBRESSL_VERSION_NUMBER < 0x3040000fL
   ssl->rbio = NULL;
@@ -1998,9 +2619,6 @@ static int socket_readerr(evutil_socket_t fd, ioa_addr *orig_addr) {
   return 0;
 }
 
-typedef unsigned char recv_ttl_t;
-typedef unsigned char recv_tos_t;
-
 int udp_recvfrom(evutil_socket_t fd, ioa_addr *orig_addr, const ioa_addr *like_addr, char *buffer, int buf_size,
                  int *ttl, int *tos, char *ecmsg, int flags, uint32_t *errcode) {
   int len = 0;
@@ -2014,8 +2632,8 @@ int udp_recvfrom(evutil_socket_t fd, ioa_addr *orig_addr, const ioa_addr *like_a
   }
 
   const int slen = get_ioa_addr_len(like_addr);
-  recv_ttl_t recv_ttl = TTL_DEFAULT;
-  recv_tos_t recv_tos = TOS_DEFAULT;
+  int recv_ttl = TTL_DEFAULT;
+  int recv_tos = TOS_DEFAULT;
 
 #if defined(_MSC_VER) || !defined(CMSG_SPACE)
   do {
@@ -2072,71 +2690,7 @@ try_again:
 #endif
 
   if (len >= 0) {
-
-    struct cmsghdr *cmsgh;
-
-    // Receive auxiliary data in msg
-    for (cmsgh = CMSG_FIRSTHDR(&msg); cmsgh != NULL; cmsgh = CMSG_NXTHDR(&msg, cmsgh)) {
-      const int l = cmsgh->cmsg_level;
-      const int t = cmsgh->cmsg_type;
-
-      switch (l) {
-      case IPPROTO_IP:
-        switch (t) {
-#if defined(IP_RECVTTL) && !defined(__sparc_v9__)
-        case IP_RECVTTL:
-        case IP_TTL:
-          recv_ttl = *((recv_ttl_t *)CMSG_DATA(cmsgh));
-          break;
-#endif
-#if defined(IP_RECVTOS)
-        case IP_RECVTOS:
-        case IP_TOS:
-          recv_tos = *((recv_tos_t *)CMSG_DATA(cmsgh));
-          break;
-#endif
-#if defined(IP_RECVERR)
-        case IP_RECVERR: {
-          struct turn_sock_extended_err *e = (struct turn_sock_extended_err *)CMSG_DATA(cmsgh);
-          if (errcode) {
-            *errcode = e->ee_errno;
-          }
-        } break;
-#endif
-        default:;
-          /* no break */
-        };
-        break;
-      case IPPROTO_IPV6:
-        switch (t) {
-#if defined(IPV6_RECVHOPLIMIT) && !defined(__sparc_v9__)
-        case IPV6_RECVHOPLIMIT:
-        case IPV6_HOPLIMIT:
-          recv_ttl = *((recv_ttl_t *)CMSG_DATA(cmsgh));
-          break;
-#endif
-#if defined(IPV6_RECVTCLASS)
-        case IPV6_RECVTCLASS:
-        case IPV6_TCLASS:
-          recv_tos = *((recv_tos_t *)CMSG_DATA(cmsgh));
-          break;
-#endif
-#if defined(IPV6_RECVERR)
-        case IPV6_RECVERR: {
-          struct turn_sock_extended_err *e = (struct turn_sock_extended_err *)CMSG_DATA(cmsgh);
-          if (errcode) {
-            *errcode = e->ee_errno;
-          }
-        } break;
-#endif
-        default:;
-          /* no break */
-        };
-        break;
-      default:;
-        /* no break */
-      };
-    }
+    ioa_parse_udp_recvmsg_cmsg(&msg, &recv_ttl, &recv_tos, errcode);
   }
 
 #endif
@@ -2151,6 +2705,141 @@ try_again:
 
   return len;
 }
+
+#if defined(__linux__)
+static int ensure_engine_recvmmsg_state(ioa_engine_handle e) {
+  if (!e) {
+    return -1;
+  }
+
+  if (e->udp_recvmmsg_state) {
+    return 0;
+  }
+
+  e->udp_recvmmsg_state = (struct ioa_socket_recvmmsg_state *)turn_calloc(1, sizeof(struct ioa_socket_recvmmsg_state));
+
+  return 0;
+}
+
+static int socket_udp_read_batch_recvmmsg(ioa_socket_handle s, int *last_len) {
+  if (last_len) {
+    *last_len = -1;
+  }
+
+  if (!s || !s->e || !s->read_cb || s->ssl || !turn_params.udp_recvmmsg) {
+    return 0;
+  }
+
+  ioa_engine_handle e = s->e;
+  if (ensure_engine_recvmmsg_state(e) < 0) {
+    return 0;
+  }
+
+  struct ioa_socket_recvmmsg_state *state = e->udp_recvmmsg_state;
+  stun_buffer_list_elem *buf_elems[MAX_SOCKET_RECVMMSG_BATCH] = {0};
+  unsigned int count = 0;
+
+  for (count = 0; count < MAX_SOCKET_RECVMMSG_BATCH; ++count) {
+    stun_buffer_list_elem *buf_elem = new_blist_elem(e);
+    if (!buf_elem) {
+      break;
+    }
+    buf_elems[count] = buf_elem;
+    ioa_init_recvmmsg_hdr(&(state->msgs[count]), &(state->iovecs[count]), &(state->src_addrs[count]),
+                          state->cmsgs[count], SOCKET_RECVMMSG_CMSG_SZ, (socklen_t)get_ioa_addr_len(&(s->local_addr)),
+                          buf_elem->buf.buf, UDP_STUN_BUFFER_SIZE);
+    state->ttls[count] = TTL_IGNORE;
+    state->toss[count] = TOS_IGNORE;
+  }
+
+  if (count == 0) {
+    ioa_engine_record_udp_recvmmsg_no_buffer(e);
+    return 0;
+  }
+
+  const int rc = recvmmsg(s->fd, state->msgs, count, MSG_DONTWAIT, NULL);
+  if (rc <= 0) {
+    for (unsigned int i = 0; i < count; ++i) {
+      free_blist_elem(e, buf_elems[i]);
+      buf_elems[i] = NULL;
+    }
+
+    if (rc == 0) {
+      ioa_engine_record_udp_recvmmsg_wouldblock(e);
+      return 1;
+    }
+
+    if (rc < 0 && (errno == ENOSYS || errno == EINVAL || errno == EOPNOTSUPP)) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING,
+                    "%s: recvmmsg() is unavailable on this system, disabling udp-recvmmsg fast path\n", __FUNCTION__);
+      ioa_engine_record_udp_recvmmsg_unavailable(e);
+      turn_params.udp_recvmmsg = false;
+      return 0;
+    }
+
+    if (would_block()) {
+      ioa_engine_record_udp_recvmmsg_wouldblock(e);
+      return 1;
+    }
+
+    return 0;
+  }
+
+  ioa_engine_record_udp_recvmmsg_batch(e, rc);
+
+  /* Wrap the per-datagram callbacks so that any sends triggered by them can
+   * be coalesced via udp_sendmmsg / UDP-GSO. Without this, the relay-side
+   * recvmmsg path issues one send syscall per delivered datagram. */
+  udp_sendmmsg_batch_begin();
+
+  for (int i = 0; i < rc; ++i) {
+    stun_buffer_list_elem *buf_elem = buf_elems[i];
+    ioa_net_data nd;
+    const int msg_len = (int)state->msgs[i].msg_len;
+
+    buf_elems[i] = NULL;
+
+    ioa_parse_udp_recvmsg_cmsg(&(state->msgs[i].msg_hdr), &(state->ttls[i]), &(state->toss[i]), NULL);
+    buf_elem->buf.len = (size_t)msg_len;
+
+    if (!ioa_socket_check_bandwidth(s, (ioa_network_buffer_handle)buf_elem, 1)) {
+      free_blist_elem(e, buf_elem);
+      continue;
+    }
+
+    memset(&nd, 0, sizeof(nd));
+    addr_cpy(&(nd.src_addr), &(state->src_addrs[i]));
+    nd.nbh = (ioa_network_buffer_handle)buf_elem;
+    nd.recv_ttl = state->ttls[i];
+    nd.recv_tos = state->toss[i];
+
+    s->read_cb(s, IOA_EV_READ, &nd, s->read_ctx, 1);
+
+    if (nd.nbh) {
+      free_blist_elem(e, buf_elem);
+    }
+
+    if (last_len) {
+      *last_len = msg_len;
+    }
+
+    if ((s->magic != SOCKET_MAGIC) || s->done || s->tobeclosed) {
+      break;
+    }
+  }
+
+  udp_sendmmsg_batch_end();
+
+  for (unsigned int i = 0; i < count; ++i) {
+    if (buf_elems[i]) {
+      free_blist_elem(e, buf_elems[i]);
+      buf_elems[i] = NULL;
+    }
+  }
+
+  return 1;
+}
+#endif
 
 #if TLS_SUPPORTED
 
@@ -2586,6 +3275,12 @@ try_start:
             if (ret != -1) {
               ret = len;
             }
+          } else if (mlen == 0 || (mlen < 0 && (size_t)blen >= STUN_BUFFER_SIZE)) {
+            /* Close rather than leave an unconsumable frame at the high watermark. */
+            s->tobeclosed = 1;
+            s->broken = 1;
+            ret = -1;
+            log_socket_event(s, "oversize or undecodable stream frame, to be closed", 1);
           }
         }
       } else if (blen < 0) {
@@ -2605,6 +3300,23 @@ try_start:
       len = -1;
     }
   } else if (s->fd >= 0) { /* UDP and DTLS */
+#if defined(__linux__)
+    /* udp_recvmmsg_eligible is set once at socket creation (shared fan-in
+     * sockets only); no per-wakeup recomputation here. */
+    if (turn_params.udp_recvmmsg && s->udp_recvmmsg_eligible && !s->ssl && s->read_cb) {
+      int batch_len = -1;
+      if (socket_udp_read_batch_recvmmsg(s, &batch_len)) {
+        /* The recvmmsg fast path allocates its own per-datagram buffers
+         * via new_blist_elem(). The `buf_elem` allocated above for the
+         * legacy single-recv path is unused here -- return it to the
+         * engine pool so it does not leak. Without this, every successful
+         * batch leaks one 64KB stun_buffer_list_elem, which under sustained
+         * load grows RSS by ~200 MB/sec/socket. */
+        free_blist_elem(s->e, buf_elem);
+        return batch_len;
+      }
+    }
+#endif
     ret = udp_recvfrom(s->fd, &remote_addr, &(s->local_addr), (char *)(buf_elem->buf.buf), UDP_STUN_BUFFER_SIZE, &ttl,
                        &tos, s->e->cmsg, 0, NULL);
     len = ret;
@@ -2919,8 +3631,8 @@ static void eventcb_bev(struct bufferevent *bev, short events, void *arg) {
       s->special_session_size = 0;
 
       if (!(s->session) && !(s->sub_session)) {
-        char sraddr[129] = "\0";
-        addr_to_string(&(s->remote_addr), (uint8_t *)sraddr);
+        char sraddr[MAX_IOA_ADDR_STRING] = "";
+        addr_to_string(&(s->remote_addr), sraddr);
         TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s https server socket closed: %p, st=%d, sat=%d, remote addr=%s\n",
                       __FUNCTION__, s, get_ioa_socket_type(s), get_ioa_socket_app_type(s), sraddr);
         IOA_CLOSE_SOCKET(s);
@@ -2943,12 +3655,12 @@ static void eventcb_bev(struct bufferevent *bev, short events, void *arg) {
           if (server) {
 
             {
-              char sraddr[129] = "\0";
-              addr_to_string(&(s->remote_addr), (uint8_t *)sraddr);
+              char sraddr[MAX_IOA_ADDR_STRING] = "";
+              addr_to_string(&(s->remote_addr), sraddr);
               if (events & BEV_EVENT_EOF) {
                 if (server->verbose) {
-                  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: %s socket closed remotely %s\n",
-                                (unsigned long long)(ss->id), socket_type_name(s->st), sraddr);
+                  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "socket closed remotely: %s (%s socket, session %018llu)\n",
+                                sraddr, socket_type_name(s->st), (unsigned long long)(ss->id));
                 }
                 if (s == ss->client_socket) {
                   char msg[256];
@@ -2972,12 +3684,12 @@ static void eventcb_bev(struct bufferevent *bev, short events, void *arg) {
                 }
               } else if (events & BEV_EVENT_ERROR) {
                 if (EVUTIL_SOCKET_ERROR()) {
-                  TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "session %018llu: %s socket error: %s %s\n",
-                                (unsigned long long)(ss->id), socket_type_name(s->st),
-                                evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()), sraddr);
+                  TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "socket error: %s %s (%s socket, session %018llu)\n",
+                                evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()), sraddr, socket_type_name(s->st),
+                                (unsigned long long)(ss->id));
                 } else if (server->verbose) {
-                  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: %s socket disconnected: %s\n",
-                                (unsigned long long)(ss->id), socket_type_name(s->st), sraddr);
+                  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "socket disconnected: %s (%s socket, session %018llu)\n", sraddr,
+                                socket_type_name(s->st), (unsigned long long)(ss->id));
                 }
                 char msg[256];
                 snprintf(msg, sizeof(msg) - 1, "%s socket buffer operation error (callback)", socket_type_name(s->st));
@@ -3110,8 +3822,12 @@ try_start:
     case SSL_ERROR_SSL:
       if (verbose) {
         TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "SSL write error: ");
-        char buf[65536];
-        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s (%d)\n", ERR_error_string(ERR_get_error(), buf), SSL_get_error(ssl, rc));
+        /* ERR_error_string() demands a caller buffer of at least 256 bytes; the
+         * _n form takes the size and truncates instead. */
+        const int ssl_err = SSL_get_error(ssl, rc);
+        char errstr[256] = {0};
+        ERR_error_string_n(ERR_get_error(), errstr, sizeof(errstr));
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s (%d)\n", errstr, ssl_err);
       }
       return -1;
     default:
@@ -3150,6 +3866,373 @@ int is_connreset(void) {
 }
 
 int would_block(void) { return socket_ewouldblock(); }
+
+#if defined(__linux__)
+typedef struct udp_sendmmsg_batch_entry {
+  ioa_socket_handle s;
+  ioa_engine_handle e;
+  evutil_socket_t fd;
+  ioa_addr dest_addr;
+  int has_dest_addr;
+  ioa_network_buffer_handle nbh;
+  int len;
+  struct iovec iov;
+} udp_sendmmsg_batch_entry;
+
+typedef struct udp_sendmmsg_batch_state {
+  unsigned int depth;
+  unsigned int count;
+  evutil_socket_t fd;
+  int ttl;
+  int tos;
+  /* GSO eligibility tracked while enqueuing: when true, all entries so far
+   * share the same destination address and size, so the batch can be flushed
+   * with one sendmsg + UDP_SEGMENT cmsg instead of N sendmsg-equivalents. */
+  int gso_eligible;
+  uint16_t gso_size;
+  udp_sendmmsg_batch_entry entries[MAX_SENDMMSG_BATCH];
+  /* Contiguous mmsghdr array passed straight to sendmmsg(), which requires a
+   * packed array (stride sizeof(struct mmsghdr)). Each slot is filled at
+   * enqueue time and points at the matching entry's stable iov/dest_addr, so
+   * the flush path needs no per-call rebuild or copy. */
+  struct mmsghdr msgs[MAX_SENDMMSG_BATCH];
+} udp_sendmmsg_batch_state;
+
+static _Thread_local udp_sendmmsg_batch_state udp_sendmmsg_batch = {0};
+
+static evutil_socket_t udp_send_fd(ioa_socket_handle s) {
+  if (!s) {
+    return -1;
+  }
+
+  if (s->parent_s) {
+    return s->parent_s->fd;
+  }
+
+  return s->fd;
+}
+
+/* Attempt to flush the batch as a single UDP-GSO sendmsg.
+ * Returns the number of datagrams handed to the kernel (== state->count) on
+ * success, or 0 if the GSO path is disabled / not eligible / not supported.
+ * On EINVAL/ENOPROTOOPT the GSO flag is sticky-disabled to avoid retrying.
+ */
+static int udp_gso_attempt_flush(void) {
+  udp_sendmmsg_batch_state *state = &udp_sendmmsg_batch;
+
+  if (!turn_params.udp_gso || !state->gso_eligible || state->count < MIN_UDP_GSO_BATCH || state->gso_size == 0 ||
+      state->gso_size > MAX_UDP_GSO_DGRAM_SIZE || state->fd < 0) {
+    return 0;
+  }
+
+  struct iovec iov[MAX_SENDMMSG_BATCH];
+  for (unsigned int i = 0; i < state->count; ++i) {
+    iov[i].iov_base = ioa_network_buffer_data(state->entries[i].nbh);
+    iov[i].iov_len = (size_t)state->entries[i].len;
+  }
+
+  union {
+    struct cmsghdr align;
+    char buf[CMSG_SPACE(sizeof(uint16_t))];
+  } cmsg_buf = {0};
+
+  struct msghdr mh = {0};
+  mh.msg_iov = iov;
+  mh.msg_iovlen = state->count;
+  if (state->entries[0].has_dest_addr) {
+    mh.msg_name = &(state->entries[0].dest_addr);
+    mh.msg_namelen = (socklen_t)get_ioa_addr_len(&(state->entries[0].dest_addr));
+  }
+  mh.msg_control = cmsg_buf.buf;
+  mh.msg_controllen = sizeof(cmsg_buf.buf);
+
+  struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+  cm->cmsg_level = SOL_UDP;
+  cm->cmsg_type = UDP_SEGMENT;
+  cm->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+  uint16_t seg = state->gso_size;
+  memcpy(CMSG_DATA(cm), &seg, sizeof(seg));
+
+  ssize_t rc = 0;
+  do {
+    rc = sendmsg(state->fd, &mh, 0);
+  } while (rc < 0 && socket_eintr());
+
+  if (rc < 0) {
+    if (errno == EINVAL || errno == ENOPROTOOPT || errno == EOPNOTSUPP) {
+      /* Kernel/NIC does not support UDP_SEGMENT here. Disable to avoid
+       * retrying on every flush; user can re-enable next process restart. */
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "UDP-GSO sendmsg failed (errno=%d), disabling --udp-gso for this process\n",
+                    errno);
+      turn_params.udp_gso = false;
+    }
+    return 0;
+  }
+
+  return (int)state->count;
+}
+
+static int udp_sendmmsg_flush(void) {
+  udp_sendmmsg_batch_state *state = &udp_sendmmsg_batch;
+  unsigned int sent = 0;
+  unsigned int gso_sent = 0;
+  const unsigned int batch_count = state->count;
+  /* All entries in a thread-local batch share the relay thread's engine. */
+  ioa_engine_handle stat_e = (batch_count > 0) ? state->entries[0].e : NULL;
+
+  if (turn_params.udp_gso) {
+    gso_sent = (unsigned int)udp_gso_attempt_flush();
+    sent = gso_sent;
+  }
+
+  if (sent < state->count && (state->count - sent) < MIN_SENDMMSG_BATCH) {
+    for (unsigned int i = sent; i < state->count; ++i) {
+      udp_sendmmsg_batch_entry *entry = &(state->entries[i]);
+      udp_send(entry->s, entry->has_dest_addr ? &(entry->dest_addr) : NULL,
+               (const char *)ioa_network_buffer_data(entry->nbh), entry->len);
+    }
+
+    sent = state->count;
+  }
+
+  /* state->msgs is already packed contiguously and was filled at enqueue
+   * time, so it can be handed straight to sendmmsg() without any rebuild. */
+  while (sent < state->count) {
+    int rc = 0;
+
+    do {
+      rc = sendmmsg(state->fd, &(state->msgs[sent]), state->count - sent, 0);
+    } while (rc < 0 && socket_eintr());
+
+    if (rc <= 0) {
+      break;
+    }
+
+    sent += (unsigned int)rc;
+  }
+
+  for (unsigned int i = sent; i < state->count; ++i) {
+    udp_sendmmsg_batch_entry *entry = &(state->entries[i]);
+    udp_send(entry->s, entry->has_dest_addr ? &(entry->dest_addr) : NULL,
+             (const char *)ioa_network_buffer_data(entry->nbh), entry->len);
+  }
+
+  for (unsigned int i = 0; i < state->count; ++i) {
+    ioa_network_buffer_delete(state->entries[i].e, state->entries[i].nbh);
+  }
+
+  ioa_engine_record_udp_sendmmsg_flush(stat_e, batch_count, gso_sent);
+
+  state->count = 0;
+  state->fd = -1;
+  state->ttl = TTL_IGNORE;
+  state->tos = TOS_IGNORE;
+  state->gso_eligible = 0;
+  state->gso_size = 0;
+
+  return (int)sent;
+}
+
+void udp_sendmmsg_batch_begin(void) {
+  if (!turn_params.udp_sendmmsg) {
+    return;
+  }
+
+  ++udp_sendmmsg_batch.depth;
+}
+
+void udp_sendmmsg_batch_end(void) {
+  if (!turn_params.udp_sendmmsg || udp_sendmmsg_batch.depth == 0) {
+    return;
+  }
+
+  --udp_sendmmsg_batch.depth;
+  if (udp_sendmmsg_batch.depth == 0) {
+    udp_sendmmsg_flush();
+  }
+}
+
+static int udp_sendmmsg_enqueue(ioa_socket_handle s, const ioa_addr *dest_addr, ioa_network_buffer_handle nbh, int ttl,
+                                int tos) {
+  udp_sendmmsg_batch_state *state = &udp_sendmmsg_batch;
+  const evutil_socket_t fd = udp_send_fd(s);
+
+  if (!turn_params.udp_sendmmsg || state->depth == 0 || fd < 0 || !nbh) {
+    return 0;
+  }
+
+  if (state->count > 0 && (state->fd != fd || state->ttl != ttl || state->tos != tos)) {
+    udp_sendmmsg_flush();
+  }
+
+  if (state->count == MAX_SENDMMSG_BATCH) {
+    udp_sendmmsg_flush();
+  }
+
+  if (state->count == 0) {
+    state->fd = fd;
+    state->ttl = ttl;
+    state->tos = tos;
+    state->gso_eligible = 1;
+    state->gso_size = 0;
+  }
+
+  udp_sendmmsg_batch_entry *entry = &(state->entries[state->count]);
+  memset(entry, 0, sizeof(*entry));
+  entry->s = s;
+  entry->e = s->e;
+  entry->fd = fd;
+  entry->nbh = nbh;
+  entry->len = (int)ioa_network_buffer_get_size(nbh);
+  entry->has_dest_addr = dest_addr != NULL;
+  if (entry->has_dest_addr) {
+    addr_cpy(&(entry->dest_addr), dest_addr);
+  }
+  entry->iov.iov_base = ioa_network_buffer_data(nbh);
+  entry->iov.iov_len = (size_t)entry->len;
+
+  /* Fill the packed mmsghdr slot for this entry. msg_name/msg_iov point at the
+   * entry's own stable storage, which lives until the batch is flushed. */
+  struct mmsghdr *mh = &(state->msgs[state->count]);
+  memset(mh, 0, sizeof(*mh));
+  if (entry->has_dest_addr) {
+    mh->msg_hdr.msg_name = &(entry->dest_addr);
+    mh->msg_hdr.msg_namelen = (socklen_t)get_ioa_addr_len(&(entry->dest_addr));
+  }
+  mh->msg_hdr.msg_iov = &(entry->iov);
+  mh->msg_hdr.msg_iovlen = 1;
+
+  /* Maintain GSO eligibility: same dest, same size, fits one segment. */
+  if (state->gso_eligible) {
+    if (entry->len <= 0 || entry->len > MAX_UDP_GSO_DGRAM_SIZE) {
+      state->gso_eligible = 0;
+    } else if (state->count == 0) {
+      /* First entry — lock in the segment size and dest. */
+      state->gso_size = (uint16_t)entry->len;
+    } else if ((uint16_t)entry->len != state->gso_size) {
+      state->gso_eligible = 0;
+    } else if (state->entries[0].has_dest_addr != entry->has_dest_addr) {
+      state->gso_eligible = 0;
+    } else if (entry->has_dest_addr && !addr_eq(&(entry->dest_addr), &(state->entries[0].dest_addr))) {
+      state->gso_eligible = 0;
+    }
+  }
+
+  ++state->count;
+
+  return 1;
+}
+
+static void udp_sendmmsg_flush_if_pending(void) {
+  if (udp_sendmmsg_batch.count > 0) {
+    udp_sendmmsg_flush();
+  }
+}
+
+static void udp_sendmmsg_flush_before_socket_options(ioa_socket_handle s, int ttl, int tos) {
+  udp_sendmmsg_batch_state *state = &udp_sendmmsg_batch;
+
+  if (state->count == 0) {
+    return;
+  }
+
+  if (state->fd == udp_send_fd(s) && (state->ttl != ttl || state->tos != tos)) {
+    udp_sendmmsg_flush();
+  }
+}
+
+static void udp_sendmmsg_flush_before_socket_invalidation(ioa_socket_handle s) {
+  udp_sendmmsg_batch_state *state = &udp_sendmmsg_batch;
+
+  if (state->count == 0) {
+    return;
+  }
+
+  /* sendmmsg()/GSO write to the cached fd, so a socket can invalidate the batch
+   * without owning any entry: child sockets queue under their parent's fd. */
+  if (state->fd == udp_send_fd(s)) {
+    udp_sendmmsg_flush();
+    return;
+  }
+
+  /* A detached socket no longer resolves to the batch fd, but its queued
+   * entries still point at it. */
+  for (unsigned int i = 0; i < state->count; ++i) {
+    if (state->entries[i].s == s) {
+      udp_sendmmsg_flush();
+      return;
+    }
+  }
+}
+#else
+void udp_sendmmsg_batch_begin(void) {}
+
+void udp_sendmmsg_batch_end(void) {}
+
+static int udp_sendmmsg_enqueue(ioa_socket_handle s, const ioa_addr *dest_addr, ioa_network_buffer_handle nbh, int ttl,
+                                int tos) {
+  UNUSED_ARG(s);
+  UNUSED_ARG(dest_addr);
+  UNUSED_ARG(nbh);
+  UNUSED_ARG(ttl);
+  UNUSED_ARG(tos);
+  return 0;
+}
+
+static void udp_sendmmsg_flush_if_pending(void) {}
+
+static void udp_sendmmsg_flush_before_socket_options(ioa_socket_handle s, int ttl, int tos) {
+  UNUSED_ARG(s);
+  UNUSED_ARG(ttl);
+  UNUSED_ARG(tos);
+}
+
+static void udp_sendmmsg_flush_before_socket_invalidation(ioa_socket_handle s) { UNUSED_ARG(s); }
+#endif
+
+void turn_reset_socket_ttl_tos(ioa_socket_handle s) {
+  if (!s) {
+    return;
+  }
+
+  /* Datagrams already queued on this fd must leave with the TTL/TOS they were queued under. */
+  udp_sendmmsg_flush_before_socket_options(s, TTL_IGNORE, TOS_IGNORE);
+  set_socket_ttl(s, TTL_IGNORE);
+  set_socket_tos(s, TOS_IGNORE);
+}
+
+#define TURN_UDP_EPERM_LOG_INTERVAL (60)
+
+/* UDP datagrams dropped on EPERM since the last warning, summed across relay threads. */
+static turn_atomic_u32 turn_udp_eperm_dropped = 0;
+static turn_atomic_u32 turn_udp_eperm_last_log = 0;
+
+static void turn_udp_eperm_drop(void) {
+  turn_atomic_fetch_add_u32(&turn_udp_eperm_dropped, 1);
+
+  const turn_time_t now = turn_time();
+  const uint32_t last = turn_atomic_load_u32(&turn_udp_eperm_last_log);
+  if ((last != 0) && ((turn_time_t)(now - last) < TURN_UDP_EPERM_LOG_INTERVAL)) {
+    return;
+  }
+  /* Only the thread that wins the timestamp update reports. */
+  if (!turn_atomic_cas_u32(&turn_udp_eperm_last_log, last, now)) {
+    return;
+  }
+
+  uint32_t dropped = 0;
+  do {
+    dropped = turn_atomic_load_u32(&turn_udp_eperm_dropped);
+  } while (!turn_atomic_cas_u32(&turn_udp_eperm_dropped, dropped, 0));
+  if (dropped == 0) {
+    return;
+  }
+
+  TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING,
+                "UDP send failed with EPERM (local packet filter or conntrack): %lu datagram(s) dropped since the "
+                "last report, sockets kept open\n",
+                (unsigned long)dropped);
+}
 
 int udp_send(ioa_socket_handle s, const ioa_addr *dest_addr, const char *buffer, int len) {
   int rc = 0;
@@ -3199,6 +4282,10 @@ int udp_send(ioa_socket_handle s, const ioa_addr *dest_addr, const char *buffer,
         // Lost packet due to overload or firewall drop... fine.
         // --twinlife-- 191024
         rc = len;
+      } else if (socket_eperm()) {
+        // A conntrack insert clash on crossing first packets returns EPERM; drop the datagram, keep the socket.
+        turn_udp_eperm_drop();
+        rc = len;
       } else if (is_connreset()) {
         if (try_again) {
           try_again = 0;
@@ -3224,104 +4311,138 @@ int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr *dest_addr, ioa_
     return -1;
   }
 
-  if (s->done || (s->fd == -1)) {
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
-                  "!!! %s: (1) Trying to send data from closed socket: %p (1): done=%d, fd=%d, st=%d, sat=%d\n",
-                  __FUNCTION__, s, (int)s->done, (int)s->fd, s->st, s->sat);
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "!!! %s socket: %p was closed\n", __FUNCTION__, s);
+  do {
+    if (s->done || (s->fd == -1)) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING,
+                    "!!! %s: (1) Trying to send data from closed socket: %p (1): done=%d, fd=%d, st=%d, sat=%d\n",
+                    __FUNCTION__, s, (int)s->done, (int)s->fd, s->st, s->sat);
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "!!! %s socket: %p was closed\n", __FUNCTION__, s);
+      break;
+    }
 
-  } else if (nbh) {
+    if (!nbh) {
+      break; /* nothing to send */
+    }
+
     if (!ioa_socket_check_bandwidth(s, nbh, 0)) {
       /* Bandwidth exhausted, we pretend everything is fine: */
-      ret = (int)(ioa_network_buffer_get_size(nbh));
+      ret = (int)ioa_network_buffer_get_size(nbh);
       if (skip) {
         *skip = 1;
       }
-    } else {
-      if (!ioa_socket_tobeclosed(s) && s->e) {
-
-        if (!(s->done || (s->fd == -1))) {
-          set_socket_ttl(s, ttl);
-          set_socket_tos(s, tos);
-
-          if (s->connected && s->bev) {
-            if ((s->st == TLS_SOCKET) || (s->st == TLS_SCTP_SOCKET)) {
-#if TLS_SUPPORTED
-              SSL *ctx = bufferevent_openssl_get_ssl(s->bev);
-              if (!ctx || SSL_get_shutdown(ctx)) {
-                s->tobeclosed = 1;
-                ret = 0;
-              }
-#endif
-            }
-
-            if (!(s->tobeclosed)) {
-
-              ret = (int)ioa_network_buffer_get_size(nbh);
-
-              if (!tcp_congestion_control || is_socket_writeable(s, (size_t)ret, __FUNCTION__, 2)) {
-                s->in_write = 1;
-                if (bufferevent_write(s->bev, ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh)) < 0) {
-                  ret = -1;
-                  perror("bufev send");
-                  log_socket_event(s, "socket write failed, to be closed", 1);
-                  s->tobeclosed = 1;
-                  s->broken = 1;
-                }
-                /*
-                bufferevent_flush(s->bev,
-                                                EV_READ|EV_WRITE,
-                                                BEV_FLUSH);
-                                                */
-                s->in_write = 0;
-              } else {
-                // drop the packet
-                ;
-              }
-            }
-          } else if (s->ssl) {
-            send_ssl_backlog_buffers(s);
-            ret = ssl_send(s, (char *)ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh),
-                           (s->e ? s->e->verbose : TURN_VERBOSE_NONE));
-            if (ret < 0) {
-              s->tobeclosed = 1;
-            } else if (ret == 0) {
-              add_buffer_to_buffer_list(&(s->bufs), (char *)ioa_network_buffer_data(nbh),
-                                        ioa_network_buffer_get_size(nbh));
-            }
-          } else if (s->fd >= 0) {
-
-            if (s->connected && !(s->parent_s)) {
-              dest_addr = NULL; /* ignore dest_addr */
-            } else if (!dest_addr) {
-              dest_addr = &(s->remote_addr);
-            }
-
-            ret = udp_send(s, dest_addr, (char *)ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh));
-            if (ret < 0) {
-              s->tobeclosed = 1;
-#if defined(EADDRNOTAVAIL)
-              const int perr = socket_errno();
-#endif
-              perror("udp send");
-#if defined(EADDRNOTAVAIL)
-              if (dest_addr && (perr == EADDRNOTAVAIL)) {
-                char sfrom[129];
-                addr_to_string(&(s->local_addr), (uint8_t *)sfrom);
-                char sto[129];
-                addr_to_string(dest_addr, (uint8_t *)sto);
-                TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: network error: address unreachable from %s to %s\n",
-                              __FUNCTION__, sfrom, sto);
-              }
-#endif
-            }
-          }
-        }
-      }
+      break;
     }
-  }
 
-  ioa_network_buffer_delete(s->e, nbh);
+    if (ioa_socket_tobeclosed(s) || !s->e) {
+      break;
+    }
+
+    /* A pending sendmmsg batch was queued under the previous ttl/tos and is
+     * per-fd; drain it before we mutate socket options or switch transports. */
+    udp_sendmmsg_flush_before_socket_options(s, ttl, tos);
+    set_socket_ttl(s, ttl);
+    set_socket_tos(s, tos);
+
+    /* ---- TLS / bufferevent transport ---- */
+    if (s->connected && s->bev) {
+      udp_sendmmsg_flush_if_pending();
+
+      if ((s->st == TLS_SOCKET) || (s->st == TLS_SCTP_SOCKET)) {
+#if TLS_SUPPORTED
+        SSL *ctx = bufferevent_openssl_get_ssl(s->bev);
+        if (!ctx || SSL_get_shutdown(ctx)) {
+          s->tobeclosed = 1;
+          ret = 0;
+        }
+#endif
+      }
+
+      if (s->tobeclosed) {
+        break;
+      }
+
+      ret = (int)ioa_network_buffer_get_size(nbh);
+
+      if (tcp_congestion_control && !is_socket_writeable(s, (size_t)ret, __FUNCTION__, 2)) {
+        break; /* drop the packet; ret already == size */
+      }
+
+      s->in_write = 1;
+      if (bufferevent_write(s->bev, ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh)) < 0) {
+        ret = -1;
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "bufev send: %s\n", strerror(errno));
+        log_socket_event(s, "socket write failed, to be closed", 1);
+        s->tobeclosed = 1;
+        s->broken = 1;
+      }
+      /*
+      bufferevent_flush(s->bev,
+                                      EV_READ|EV_WRITE,
+                                      BEV_FLUSH);
+                                      */
+      s->in_write = 0;
+      break;
+    }
+
+    /* ---- OpenSSL (DTLS) transport ---- */
+    if (s->ssl) {
+      udp_sendmmsg_flush_if_pending();
+      send_ssl_backlog_buffers(s);
+      ret = ssl_send(s, (char *)ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh),
+                     (s->e ? s->e->verbose : TURN_VERBOSE_NONE));
+      if (ret < 0) {
+        s->tobeclosed = 1;
+      } else if (ret == 0) {
+        add_buffer_to_buffer_list(&(s->bufs), (char *)ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh));
+      }
+      break;
+    }
+
+    /* ---- plain UDP transport (sendmmsg-batchable) ---- */
+    if (s->fd >= 0) {
+      if (s->connected && !(s->parent_s)) {
+        dest_addr = NULL; /* ignore dest_addr */
+      } else if (!dest_addr) {
+        dest_addr = &(s->remote_addr);
+      }
+
+      ret = (int)ioa_network_buffer_get_size(nbh);
+
+      /* Coalesce into the per-thread sendmmsg batch. On success the batch takes
+       * ownership of nbh (freed at flush), so clear our handle to suppress the
+       * tail delete below. */
+      if (udp_sendmmsg_enqueue(s, dest_addr, nbh, ttl, tos)) {
+        nbh = NULL;
+        break;
+      }
+
+      udp_sendmmsg_flush_if_pending();
+      ret = udp_send(s, dest_addr, (char *)ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh));
+      if (ret < 0) {
+        s->tobeclosed = 1;
+#if defined(EADDRNOTAVAIL)
+        const int perr = socket_errno();
+#endif
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "udp send: %s\n", strerror(errno));
+#if defined(EADDRNOTAVAIL)
+        if (dest_addr && (perr == EADDRNOTAVAIL)) {
+          char sfrom[MAX_IOA_ADDR_STRING] = "";
+          addr_to_string(&(s->local_addr), sfrom);
+          char sto[MAX_IOA_ADDR_STRING] = "";
+          addr_to_string(dest_addr, sto);
+          TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: network error: address unreachable from %s to %s\n", __FUNCTION__,
+                        sfrom, sto);
+        }
+#endif
+      }
+      break;
+    }
+
+  } while (0);
+
+  if (nbh) {
+    ioa_network_buffer_delete(s->e, nbh);
+  }
 
   return ret;
 }
@@ -3355,7 +4476,7 @@ int send_data_from_ioa_socket_tcp(ioa_socket_handle s, const void *data, size_t 
         s->in_write = 1;
         if (bufferevent_write(s->bev, data, sz) < 0) {
           ret = -1;
-          perror("bufev send");
+          TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "bufev send: %s\n", strerror(errno));
           log_socket_event(s, "socket write failed, to be closed", 1);
           s->tobeclosed = 1;
           s->broken = 1;
@@ -3542,6 +4663,15 @@ ioa_network_buffer_handle ioa_network_buffer_allocate(ioa_engine_handle e) {
 /* We do not use special header in this simple implementation */
 void ioa_network_buffer_header_init(ioa_network_buffer_handle nbh) { UNUSED_ARG(nbh); }
 
+void ioa_network_buffer_reset(ioa_network_buffer_handle nbh) {
+  if (nbh) {
+    stun_buffer_list_elem *buf_elem = (stun_buffer_list_elem *)nbh;
+    buf_elem->buf.len = 0;
+    buf_elem->buf.offset = 0;
+    buf_elem->buf.coffset = 0;
+  }
+}
+
 uint8_t *ioa_network_buffer_data(ioa_network_buffer_handle nbh) {
   stun_buffer_list_elem *buf_elem = (stun_buffer_list_elem *)nbh;
   return buf_elem->buf.buf + buf_elem->buf.offset - buf_elem->buf.coffset;
@@ -3624,13 +4754,13 @@ void stun_report_binding(void *a, STUN_PROMETHEUS_METRIC_TYPE type) {
 #if !defined(TURN_NO_PROMETHEUS)
   UNUSED_ARG(a);
   switch (type) {
-  case 0:
+  case STUN_PROMETHEUS_METRIC_TYPE_REQUEST:
     prom_inc_stun_binding_request();
     break;
-  case 1:
+  case STUN_PROMETHEUS_METRIC_TYPE_RESPONSE:
     prom_inc_stun_binding_response();
     break;
-  case 2:
+  case STUN_PROMETHEUS_METRIC_TYPE_ERROR:
     prom_inc_stun_binding_error();
     break;
   default:
@@ -3656,14 +4786,16 @@ void turn_report_allocation_set(void *a, turn_time_t lifetime, int refresh) {
         if (e && e->verbose && ss->client_socket) {
           if (ss->client_socket->ssl) {
             TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
-                          "session %018llu: %s, realm=<%s>, username=<%s>, lifetime=%lu, cipher=%s, method=%s\n",
-                          (unsigned long long)ss->id, status, (char *)ss->realm_options.name, (char *)ss->username,
-                          (unsigned long)lifetime, SSL_get_cipher(ss->client_socket->ssl),
-                          turn_get_ssl_method(ss->client_socket->ssl, "UNKNOWN"));
+                          "allocation %s, realm=<%s>, username=<%s>, lifetime=%lu, cipher=%s, method=%s "
+                          "(session %018llu)\n",
+                          status, (char *)ss->realm_options.name, (char *)ss->username, (unsigned long)lifetime,
+                          SSL_get_cipher(ss->client_socket->ssl),
+                          turn_get_ssl_method(ss->client_socket->ssl, "UNKNOWN"), (unsigned long long)ss->id);
           } else {
-            TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: %s, realm=<%s>, username=<%s>, lifetime=%lu\n",
-                          (unsigned long long)ss->id, status, (char *)ss->realm_options.name, (char *)ss->username,
-                          (unsigned long)lifetime);
+            TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
+                          "allocation %s, realm=<%s>, username=<%s>, lifetime=%lu (session %018llu)\n", status,
+                          (char *)ss->realm_options.name, (char *)ss->username, (unsigned long)lifetime,
+                          (unsigned long long)ss->id);
           }
         }
 #if !defined(TURN_NO_HIREDIS)
@@ -3676,8 +4808,8 @@ void turn_report_allocation_set(void *a, turn_time_t lifetime, int refresh) {
             snprintf(key, sizeof(key), "turn/user/%s/allocation/%018llu/status", (char *)ss->username,
                      (unsigned long long)ss->id);
           }
-          uint8_t saddr[129];
-          uint8_t rsaddr[129];
+          char saddr[MAX_IOA_ADDR_STRING] = "";
+          char rsaddr[MAX_IOA_ADDR_STRING] = "";
           addr_to_string(get_local_addr_from_ioa_socket(ss->client_socket), saddr);
           addr_to_string(get_remote_addr_from_ioa_socket(ss->client_socket), rsaddr);
           const char *type = socket_type_name(get_ioa_socket_type(ss->client_socket));
@@ -3692,7 +4824,9 @@ void turn_report_allocation_set(void *a, turn_time_t lifetime, int refresh) {
 #endif
         {
           if (!refresh) {
-            prom_inc_allocation(get_ioa_socket_type(ss->client_socket));
+            ss->prom_alloc_socket_type = get_ioa_socket_type(ss->client_socket);
+            ss->prom_alloc_family = get_ioa_socket_address_family(ss->client_socket);
+            prom_inc_allocation(ss->prom_alloc_socket_type, ss->prom_alloc_family);
             increment_global_allocation_count();
           }
         }
@@ -3709,8 +4843,8 @@ void turn_report_allocation_delete(void *a, SOCKET_TYPE socket_type) {
       if (server) {
         ioa_engine_handle e = turn_server_get_engine(server);
         if (e && e->verbose) {
-          TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "session %018llu: delete: realm=<%s>, username=<%s>\n",
-                        (unsigned long long)ss->id, (char *)ss->realm_options.name, (char *)ss->username);
+          TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "allocation delete: realm=<%s>, username=<%s> (session %018llu)\n",
+                        (char *)ss->realm_options.name, (char *)ss->username, (unsigned long long)ss->id);
         }
 #if !defined(TURN_NO_HIREDIS)
         if (e) {
@@ -3770,7 +4904,10 @@ void turn_report_allocation_delete(void *a, SOCKET_TYPE socket_type) {
                                       (unsigned long)(ss->t_peer_sent_packets), (unsigned long)(ss->t_peer_sent_bytes),
                                       true);
           }
-          prom_dec_allocation(socket_type);
+          /* Teardown's socket_type can be UNKNOWN once the client socket is gone.
+           * The gauge series was fixed when the allocation was created. */
+          UNUSED_ARG(socket_type);
+          prom_dec_allocation(ss->prom_alloc_socket_type, ss->prom_alloc_family);
           decrement_global_allocation_count();
         }
       }
@@ -3788,15 +4925,16 @@ void turn_report_session_usage(void *session, int force_invalid) {
           force_invalid) {
         if (e && e->verbose) {
           TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
-                        "session %018llu: usage: realm=<%s>, username=<%s>, rp=%lu, rb=%lu, sp=%lu, sb=%lu\n",
-                        (unsigned long long)(ss->id), (char *)ss->realm_options.name, (char *)ss->username,
-                        (unsigned long)(ss->received_packets), (unsigned long)(ss->received_bytes),
-                        (unsigned long)(ss->sent_packets), (unsigned long)(ss->sent_bytes));
+                        "usage: realm=<%s>, username=<%s>, rp=%lu, rb=%lu, sp=%lu, sb=%lu (session %018llu)\n",
+                        (char *)ss->realm_options.name, (char *)ss->username, (unsigned long)(ss->received_packets),
+                        (unsigned long)(ss->received_bytes), (unsigned long)(ss->sent_packets),
+                        (unsigned long)(ss->sent_bytes), (unsigned long long)(ss->id));
           TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
-                        "session %018llu: peer usage: realm=<%s>, username=<%s>, rp=%lu, rb=%lu, sp=%lu, sb=%lu\n",
-                        (unsigned long long)(ss->id), (char *)ss->realm_options.name, (char *)ss->username,
+                        "peer usage: realm=<%s>, username=<%s>, rp=%lu, rb=%lu, sp=%lu, sb=%lu (session %018llu)\n",
+                        (char *)ss->realm_options.name, (char *)ss->username,
                         (unsigned long)(ss->peer_received_packets), (unsigned long)(ss->peer_received_bytes),
-                        (unsigned long)(ss->peer_sent_packets), (unsigned long)(ss->peer_sent_bytes));
+                        (unsigned long)(ss->peer_sent_packets), (unsigned long)(ss->peer_sent_bytes),
+                        (unsigned long long)(ss->id));
         }
 #if !defined(TURN_NO_HIREDIS)
         if (e) {
@@ -3847,6 +4985,13 @@ void turn_report_session_usage(void *session, int force_invalid) {
 
         report_turn_session_info(server, ss, force_invalid);
 
+        if (force_invalid) {
+          const turn_dbdriver_t *dbd = get_dbdriver();
+          if (dbd && dbd->report_usage) {
+            dbd->report_usage(session);
+          }
+        }
+
         ss->received_packets = 0;
         ss->received_bytes = 0;
         ss->sent_packets = 0;
@@ -3881,7 +5026,6 @@ const char *get_ioa_socket_tls_method(ioa_socket_handle s) {
 #define TURN_SM_SIZE (1024 << 11)
 
 struct _super_memory {
-  TURN_MUTEX_DECLARE(mutex_sm)
   char **super_memory;
   size_t *sm_allocated;
   size_t sm_total_sz;
@@ -3891,14 +5035,9 @@ struct _super_memory {
 
 static void init_super_memory_region(super_memory_t *r) {
   if (r) {
-    r->super_memory = (char **)malloc(sizeof(char *));
-    r->super_memory[0] = (char *)calloc(1, TURN_SM_SIZE);
-    r->sm_allocated = (size_t *)malloc(sizeof(size_t));
-
-    if (r->sm_allocated == NULL || r->super_memory == NULL) {
-      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: failure in call to calloc \n", __FUNCTION__);
-      return;
-    }
+    r->super_memory = (char **)turn_malloc(sizeof(char *));
+    r->super_memory[0] = (char *)turn_calloc(1, TURN_SM_SIZE);
+    r->sm_allocated = (size_t *)turn_malloc(sizeof(size_t));
 
     r->sm_allocated[0] = 0;
 
@@ -3908,15 +5047,13 @@ static void init_super_memory_region(super_memory_t *r) {
     while (r->id == 0) {
       r->id = (uint32_t)turn_random_number();
     }
-
-    TURN_MUTEX_INIT(&r->mutex_sm);
   }
 }
 
 void init_super_memory(void) { ; }
 
 super_memory_t *new_super_memory_region(void) {
-  super_memory_t *r = (super_memory_t *)calloc(1, sizeof(super_memory_t));
+  super_memory_t *r = (super_memory_t *)turn_calloc(1, sizeof(super_memory_t));
   init_super_memory_region(r);
   return r;
 }
@@ -3929,11 +5066,9 @@ void *allocate_super_memory_region_func(super_memory_t *r, size_t size, const ch
   void *ret = NULL;
 
   if (!r) {
-    ret = calloc(1, size);
+    ret = turn_calloc(1, size);
     return ret;
   }
-
-  TURN_MUTEX_LOCK(&r->mutex_sm);
 
   size = ((size_t)((size + sizeof(void *)) / (sizeof(void *)))) * sizeof(void *);
 
@@ -3965,9 +5100,9 @@ void *allocate_super_memory_region_func(super_memory_t *r, size_t size, const ch
 
     if (!region) {
       r->sm_chunk += 1;
-      r->super_memory = (char **)realloc(r->super_memory, (r->sm_chunk + 1) * sizeof(char *));
-      r->super_memory[r->sm_chunk] = (char *)calloc(1, TURN_SM_SIZE);
-      r->sm_allocated = (size_t *)realloc(r->sm_allocated, (r->sm_chunk + 1) * sizeof(size_t));
+      r->super_memory = (char **)turn_realloc(r->super_memory, (r->sm_chunk + 1) * sizeof(char *));
+      r->super_memory[r->sm_chunk] = (char *)turn_calloc(1, TURN_SM_SIZE);
+      r->sm_allocated = (size_t *)turn_realloc(r->sm_allocated, (r->sm_chunk + 1) * sizeof(size_t));
       r->sm_allocated[r->sm_chunk] = 0;
       region = r->super_memory[r->sm_chunk];
       rsz = r->sm_allocated + r->sm_chunk;
@@ -3984,10 +5119,8 @@ void *allocate_super_memory_region_func(super_memory_t *r, size_t size, const ch
     }
   }
 
-  TURN_MUTEX_UNLOCK(&r->mutex_sm);
-
   if (!ret) {
-    ret = calloc(1, size);
+    ret = turn_calloc(1, size);
   }
 
   return ret;

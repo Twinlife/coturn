@@ -34,7 +34,10 @@
 
 #include "prom_server.h"
 #include "mainrelay.h"
+#include "ns_turn_atomic.h" // for TURN_THREAD_LOCAL (portable thread-local on MSVC)
+#include "ns_turn_ratelimit.h"
 #include "ns_turn_utils.h"
+#include <stdio.h>
 #if !defined(WINDOWS)
 #include <errno.h>
 #include <sys/socket.h>
@@ -49,6 +52,17 @@ prom_counter_t *packet_dropped;
 prom_counter_t *stun_binding_request;
 prom_counter_t *stun_binding_response;
 prom_counter_t *stun_binding_error;
+
+prom_counter_t *turn_unauthenticated_401_requests;
+prom_counter_t *turn_unauthenticated_401_responses;
+prom_counter_t *turn_unauthenticated_401_dropped_responses;
+prom_counter_t *turn_unauthenticated_401_would_drop_responses;
+
+prom_counter_t *turn_auth_credential_failures;
+
+prom_counter_t *turn_ratelimit_hash_collisions;
+prom_gauge_t *turn_ratelimit_occupied_buckets;
+prom_gauge_t *turn_ratelimit_total_buckets;
 
 prom_counter_t *turn_traffic_rcvp;
 prom_counter_t *turn_traffic_rcvb;
@@ -72,15 +86,43 @@ prom_counter_t *turn_total_traffic_peer_sentb;
 
 prom_gauge_t *turn_total_allocations;
 
+prom_counter_t *turn_udp_recvmmsg_calls;
+prom_counter_t *turn_udp_recvmmsg_packets;
+prom_counter_t *turn_udp_sendmmsg_flushes;
+prom_counter_t *turn_udp_sendmmsg_datagrams;
+prom_counter_t *turn_udp_sendmmsg_gso_datagrams;
+
 #if MHD_VERSION >= 0x00097002
 #define MHD_RESULT enum MHD_Result
 #else
 #define MHD_RESULT int
 #endif
 
-MHD_RESULT promhttp_handler(void *cls, struct MHD_Connection *connection, const char *url, const char *method,
-                            const char *version, const char *upload_data, size_t *upload_data_size, void **con_cls) {
+// Pull the 401 rate-limit table's self-instrumented stats into Prometheus
+// metrics. Called only from the single MHD scrape thread, so the static delta
+// tracker below needs no locking. The whole-table scan in
+// ratelimit_count_occupied() touches the buckets once per scrape and never runs
+// on the data path, so this stays off the hot path entirely.
+static void prom_refresh_ratelimit_stats(void) {
+  static uint32_t last_collisions = 0;
+  uint32_t cur = ratelimit_get_collisions();
+  uint32_t delta = cur - last_collisions; // unsigned subtraction is correct across the 2^32 wrap
+  if (delta) {
+    prom_counter_add(turn_ratelimit_hash_collisions, (double)delta, NULL);
+    last_collisions = cur;
+  }
+  prom_gauge_set(turn_ratelimit_occupied_buckets, (double)ratelimit_count_occupied(), NULL);
+}
+
+static MHD_RESULT promhttp_handler(void *cls, struct MHD_Connection *connection, const char *url, const char *method,
+                                   const char *version, const char *upload_data, size_t *upload_data_size,
+                                   void **con_cls) {
   MHD_RESULT ret;
+  (void)cls;
+  (void)version;
+  (void)upload_data;
+  (void)upload_data_size;
+  (void)con_cls;
 
   char *body = "not found";
   enum MHD_ResponseMemoryMode mode = MHD_RESPMEM_PERSISTENT;
@@ -90,7 +132,11 @@ MHD_RESULT promhttp_handler(void *cls, struct MHD_Connection *connection, const 
     status = MHD_HTTP_METHOD_NOT_ALLOWED;
     body = "method not allowed";
   } else if (strcmp(url, turn_params.prometheus_path) == 0) {
-    body = prom_collector_registry_bridge(PROM_COLLECTOR_REGISTRY_DEFAULT);
+    prom_refresh_ratelimit_stats();
+    body = (char *)prom_collector_registry_bridge(PROM_COLLECTOR_REGISTRY_DEFAULT);
+    if (body == NULL) {
+      return MHD_NO;
+    }
     mode = MHD_RESPMEM_MUST_FREE;
     status = MHD_HTTP_OK;
   } else if (strcmp(url, "/") == 0) {
@@ -107,11 +153,37 @@ MHD_RESULT promhttp_handler(void *cls, struct MHD_Connection *connection, const 
     }
     ret = MHD_NO;
   } else {
-    MHD_add_response_header(response, "Content-Type", "text/plain");
+    MHD_add_response_header(response, "Content-Type", "text/plain; version=0.0.4; charset=utf-8");
     ret = MHD_queue_response(connection, status, response);
     MHD_destroy_response(response);
   }
   return ret;
+}
+
+/* Read an entire file into a freshly malloc'd NUL-terminated buffer, or return
+ * NULL on error. Used to load the PEM cert/key for the HTTPS metrics endpoint. */
+static char *prom_read_file(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (f == NULL) {
+    return NULL;
+  }
+  char *buf = NULL;
+  if (fseek(f, 0, SEEK_END) == 0) {
+    long size = ftell(f);
+    if (size >= 0 && fseek(f, 0, SEEK_SET) == 0) {
+      buf = turn_malloc((size_t)size + 1);
+      if (buf != NULL) {
+        if (fread(buf, 1, (size_t)size, f) != (size_t)size) {
+          free(buf);
+          buf = NULL;
+        } else {
+          buf[size] = '\0';
+        }
+      }
+    }
+  }
+  fclose(f);
+  return buf;
 }
 
 void start_prometheus_server(void) {
@@ -136,6 +208,37 @@ void start_prometheus_server(void) {
       prom_counter_new("stun_binding_response", "Outgoing STUN Binding responses", 0, NULL));
   stun_binding_error = prom_collector_registry_must_register_metric(
       prom_counter_new("stun_binding_error", "STUN Binding errors", 0, NULL));
+
+  turn_unauthenticated_401_requests = prom_collector_registry_must_register_metric(prom_counter_new(
+      "turn_unauthenticated_401_requests", "UDP requests requiring a 401 Unauthorized response", 0, NULL));
+  turn_unauthenticated_401_responses = prom_collector_registry_must_register_metric(
+      prom_counter_new("turn_unauthenticated_401_responses", "UDP 401 Unauthorized responses emitted", 0, NULL));
+  turn_unauthenticated_401_dropped_responses = prom_collector_registry_must_register_metric(prom_counter_new(
+      "turn_unauthenticated_401_dropped_responses", "UDP 401 responses suppressed by DDoS mitigation", 0, NULL));
+  turn_unauthenticated_401_would_drop_responses = prom_collector_registry_must_register_metric(
+      prom_counter_new("turn_unauthenticated_401_would_drop_responses",
+                       "UDP 401 responses the rate limit would suppress, sent in observe mode", 0, NULL));
+
+  const char *causeLabel[] = {"cause"};
+  turn_auth_credential_failures = prom_collector_registry_must_register_metric(
+      prom_counter_new("turn_auth_credential_failures",
+                       "Rejected authentications by cause: expired (time-limited username timestamp has passed; "
+                       "rejected before integrity verification), integrity_mismatch (wrong credentials), or "
+                       "not_found (unknown user)",
+                       1, causeLabel));
+
+  // 401 rate-limit hash-table health. Refreshed lazily at scrape time from the
+  // lock-free table's self-instrumented counters (see prom_refresh_ratelimit_stats).
+  turn_ratelimit_hash_collisions = prom_collector_registry_must_register_metric(
+      prom_counter_new("turn_ratelimit_hash_collisions",
+                       "401 rate-limit hash-bucket collisions (a source sharing another's live bucket)", 0, NULL));
+  turn_ratelimit_occupied_buckets = prom_collector_registry_must_register_metric(prom_gauge_new(
+      "turn_ratelimit_occupied_buckets", "401 rate-limit buckets currently tracking a live window", 0, NULL));
+  turn_ratelimit_total_buckets = prom_collector_registry_must_register_metric(
+      prom_gauge_new("turn_ratelimit_total_buckets", "401 rate-limit hash table capacity in buckets", 0, NULL));
+  // Capacity is a compile-time constant; publish it once so occupancy can be
+  // read as a utilization ratio in PromQL.
+  prom_gauge_set(turn_ratelimit_total_buckets, (double)ratelimit_get_capacity(), NULL);
 
   // Create TURN traffic counter metrics
   turn_traffic_rcvp = prom_collector_registry_must_register_metric(
@@ -177,15 +280,29 @@ void start_prometheus_server(void) {
   turn_total_traffic_peer_sentb = prom_collector_registry_must_register_metric(
       prom_counter_new("turn_total_traffic_peer_sentb", "Represents total finished sessions peer sent bytes", 0, NULL));
 
-  // Create total allocations number gauge metric
-  const char *typeLabel[] = {"type"};
-  turn_total_allocations = prom_collector_registry_must_register_metric(
-      prom_gauge_new("turn_total_allocations", "Represents current allocations number", 1, typeLabel));
+  // type is the client socket; protocol is tcp/udp/sctp (TLS is tcp, DTLS is udp);
+  // family is the client address family (ipv4 or ipv6).
+  const char *alloc_labels[] = {"type", "protocol", "family"};
+  turn_total_allocations = prom_collector_registry_must_register_metric(prom_gauge_new(
+      "turn_total_allocations", "Current allocations by client socket type, protocol, and IP family", 3, alloc_labels));
   // Packet counters
   packet_processed = prom_collector_registry_must_register_metric(
       prom_counter_new("turn_packet_processed", "Incoming packet processed", 0, NULL));
   packet_dropped = prom_collector_registry_must_register_metric(
       prom_counter_new("turn_packet_dropped", "Incoming packet dropped", 0, NULL));
+
+  // UDP recvmmsg/sendmmsg batching counters (Linux). Bumped once per syscall;
+  // average batch size = rate(packets)/rate(calls) and rate(datagrams)/rate(flushes).
+  turn_udp_recvmmsg_calls = prom_collector_registry_must_register_metric(
+      prom_counter_new("turn_udp_recvmmsg_calls", "recvmmsg() syscalls that returned at least one datagram", 0, NULL));
+  turn_udp_recvmmsg_packets = prom_collector_registry_must_register_metric(
+      prom_counter_new("turn_udp_recvmmsg_packets", "Datagrams received via recvmmsg()", 0, NULL));
+  turn_udp_sendmmsg_flushes = prom_collector_registry_must_register_metric(
+      prom_counter_new("turn_udp_sendmmsg_flushes", "Egress batch flushes (sendmmsg/UDP-GSO)", 0, NULL));
+  turn_udp_sendmmsg_datagrams = prom_collector_registry_must_register_metric(
+      prom_counter_new("turn_udp_sendmmsg_datagrams", "Datagrams sent via egress batches", 0, NULL));
+  turn_udp_sendmmsg_gso_datagrams = prom_collector_registry_must_register_metric(
+      prom_counter_new("turn_udp_sendmmsg_gso_datagrams", "Datagrams coalesced via a single UDP-GSO sendmsg", 0, NULL));
 
   // some flags appeared first in microhttpd v0.9.53
   unsigned int flags = 0;
@@ -205,6 +322,42 @@ void start_prometheus_server(void) {
     // In this case the prometheus server will be unreachable
     TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "prometheus exporter server will start using SELECT. "
                                           "The exporter might be unreachable on highly used servers\n");
+  }
+
+  // Optional HTTPS for the metrics endpoint. The cert/key buffers are kept for
+  // the daemon's (process) lifetime, as libmicrohttpd references them.
+  char *https_cert = NULL;
+  char *https_key = NULL;
+  if (turn_params.prometheus_tls) {
+    const char *cert_path =
+        turn_params.prometheus_cert_file[0] ? turn_params.prometheus_cert_file : turn_params.cert_file;
+    const char *key_path =
+        turn_params.prometheus_pkey_file[0] ? turn_params.prometheus_pkey_file : turn_params.pkey_file;
+    if (!cert_path[0] || !key_path[0]) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "prometheus TLS requested but no certificate/key is configured "
+                                          "(set --prometheus-cert/--prometheus-key or the server --cert/--pkey)\n");
+      return;
+    }
+#if MHD_VERSION >= 0x00095300
+    if (!MHD_is_feature_supported(MHD_FEATURE_TLS)) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "prometheus TLS requested but libmicrohttpd was built without TLS support\n");
+      return;
+    }
+#endif
+    https_cert = prom_read_file(cert_path);
+    https_key = prom_read_file(key_path);
+    if (https_cert == NULL || https_key == NULL) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "prometheus TLS: could not read certificate '%s' or key '%s'\n", cert_path,
+                    key_path);
+      free(https_cert);
+      free(https_key);
+      return;
+    }
+#if MHD_VERSION >= 0x00095300
+    flags |= MHD_USE_TLS;
+#else
+    flags |= MHD_USE_SSL;
+#endif
   }
 
   ioa_addr server_addr;
@@ -229,15 +382,24 @@ void start_prometheus_server(void) {
     }
   }
 
-  uint8_t addr[MAX_IOA_ADDR_STRING];
+  char addr[MAX_IOA_ADDR_STRING] = "";
   addr_to_string(&server_addr, addr);
-  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "prometheus exporter server will listen on %s\n", addr);
+  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "prometheus exporter server will listen on %s (%s)\n", addr,
+                turn_params.prometheus_tls ? "https" : "http");
 
-  struct MHD_Daemon *daemon =
-      MHD_start_daemon(flags, 0, NULL, NULL, &promhttp_handler, NULL, MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
-                       MHD_OPTION_SOCK_ADDR, &server_addr, MHD_OPTION_END);
+  struct MHD_Daemon *daemon;
+  if (turn_params.prometheus_tls) {
+    daemon = MHD_start_daemon(flags, 0, NULL, NULL, &promhttp_handler, NULL, MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
+                              MHD_OPTION_SOCK_ADDR, &server_addr, MHD_OPTION_HTTPS_MEM_CERT, https_cert,
+                              MHD_OPTION_HTTPS_MEM_KEY, https_key, MHD_OPTION_END);
+  } else {
+    daemon = MHD_start_daemon(flags, 0, NULL, NULL, &promhttp_handler, NULL, MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
+                              MHD_OPTION_SOCK_ADDR, &server_addr, MHD_OPTION_END);
+  }
   if (daemon == NULL) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "could not start prometheus collector\n");
+    free(https_cert);
+    free(https_key);
     return;
   }
 
@@ -277,29 +439,173 @@ void prom_set_finished_traffic(const char *realm, const char *user, unsigned lon
   }
 }
 
-void prom_inc_allocation(SOCKET_TYPE type) {
+/* L4 protocol of a client socket. TLS is tcp and DTLS is udp: the type label
+ * already distinguishes the encrypted variants. */
+static const char *prom_alloc_protocol(SOCKET_TYPE type) {
+  if (is_sctp_socket(type)) {
+    return "sctp";
+  }
+  if (is_tcp_socket(type) || type == TCP_SOCKET_PROXY) {
+    return "tcp";
+  }
+  if (type == UDP_SOCKET || type == DTLS_SOCKET) {
+    return "udp";
+  }
+  return "unknown";
+}
+
+static const char *prom_alloc_family(int family) {
+  if (family == AF_INET) {
+    return "ipv4";
+  }
+  if (family == AF_INET6) {
+    return "ipv6";
+  }
+  return "unknown";
+}
+
+static void prom_alloc_labels(SOCKET_TYPE type, int family, const char **label) {
+  label[0] = socket_type_name(type);
+  label[1] = prom_alloc_protocol(type);
+  label[2] = prom_alloc_family(family);
+}
+
+void prom_inc_allocation(SOCKET_TYPE type, int family) {
   if (turn_params.prometheus) {
-    const char *label[] = {socket_type_name(type)};
+    const char *label[3];
+    prom_alloc_labels(type, family, label);
     prom_gauge_inc(turn_total_allocations, label);
   }
 }
 
-void prom_dec_allocation(SOCKET_TYPE type) {
+void prom_dec_allocation(SOCKET_TYPE type, int family) {
   if (turn_params.prometheus) {
-    const char *label[] = {socket_type_name(type)};
+    const char *label[3];
+    prom_alloc_labels(type, family, label);
     prom_gauge_dec(turn_total_allocations, label);
   }
 }
 
-void prom_inc_packet_processed(int count) {
-  if (turn_params.prometheus == 1) {
-    prom_counter_add(packet_processed, count, NULL);
+void prom_flush_udp_counters(const struct prom_udp_counter_deltas *d) {
+  if (!turn_params.prometheus || !d) {
+    return;
+  }
+  if (d->packets_processed) {
+    prom_counter_add(packet_processed, (double)d->packets_processed, NULL);
+  }
+  if (d->packets_dropped) {
+    prom_counter_add(packet_dropped, (double)d->packets_dropped, NULL);
+  }
+  if (d->recvmmsg_calls) {
+    prom_counter_add(turn_udp_recvmmsg_calls, (double)d->recvmmsg_calls, NULL);
+  }
+  if (d->recvmmsg_packets) {
+    prom_counter_add(turn_udp_recvmmsg_packets, (double)d->recvmmsg_packets, NULL);
+  }
+  if (d->sendmmsg_flushes) {
+    prom_counter_add(turn_udp_sendmmsg_flushes, (double)d->sendmmsg_flushes, NULL);
+  }
+  if (d->sendmmsg_datagrams) {
+    prom_counter_add(turn_udp_sendmmsg_datagrams, (double)d->sendmmsg_datagrams, NULL);
+  }
+  if (d->sendmmsg_gso_datagrams) {
+    prom_counter_add(turn_udp_sendmmsg_gso_datagrams, (double)d->sendmmsg_gso_datagrams, NULL);
   }
 }
 
-void prom_inc_packet_dropped(int count) {
-  if (turn_params.prometheus == 1) {
-    prom_counter_add(packet_dropped, count, NULL);
+/* The 401 mitigation counters are bumped on the relay hot path (once per
+ * unauthenticated UDP request -- the reflection surface, and the busiest path
+ * under the very flood this feature mitigates). To keep the global prom_counter
+ * locks off that path, each relay thread accumulates into lock-free
+ * thread-local counters here and prom_flush_401_counters() pushes the deltas
+ * once per second from the engine timer -- mirroring the UDP packet counters
+ * (see prom_flush_udp_counters / maybe_flush_prom_counters). */
+static TURN_THREAD_LOCAL uint64_t tl_401_requests, tl_401_requests_flushed;
+static TURN_THREAD_LOCAL uint64_t tl_401_responses, tl_401_responses_flushed;
+static TURN_THREAD_LOCAL uint64_t tl_401_dropped, tl_401_dropped_flushed;
+static TURN_THREAD_LOCAL uint64_t tl_401_would_drop, tl_401_would_drop_flushed;
+
+/* Auth-failure counters take the same lock-free thread-local path: a client holding a valid
+ * nonce can drive them from every relay thread, so the prom registry lock stays off it. */
+static TURN_THREAD_LOCAL uint64_t tl_auth_fail_expired, tl_auth_fail_expired_flushed;
+static TURN_THREAD_LOCAL uint64_t tl_auth_fail_mismatch, tl_auth_fail_mismatch_flushed;
+static TURN_THREAD_LOCAL uint64_t tl_auth_fail_not_found, tl_auth_fail_not_found_flushed;
+
+void prom_inc_unauthenticated_401_request(void) {
+  if (turn_params.prometheus) {
+    tl_401_requests++;
+  }
+}
+
+void prom_inc_unauthenticated_401_response(void) {
+  if (turn_params.prometheus) {
+    tl_401_responses++;
+  }
+}
+
+void prom_inc_unauthenticated_401_dropped_response(void) {
+  if (turn_params.prometheus) {
+    tl_401_dropped++;
+  }
+}
+
+void prom_inc_unauthenticated_reply_verdict(int err_code, turn_ratelimit_verdict verdict) {
+  if (turn_params.prometheus && err_code == 401 && verdict == TURN_RATELIMIT_WOULD_SUPPRESS) {
+    tl_401_would_drop++;
+  }
+}
+
+void prom_flush_401_counters(void) {
+  if (!turn_params.prometheus) {
+    return;
+  }
+  uint64_t d;
+  if ((d = tl_401_requests - tl_401_requests_flushed)) {
+    prom_counter_add(turn_unauthenticated_401_requests, (double)d, NULL);
+    tl_401_requests_flushed = tl_401_requests;
+  }
+  if ((d = tl_401_responses - tl_401_responses_flushed)) {
+    prom_counter_add(turn_unauthenticated_401_responses, (double)d, NULL);
+    tl_401_responses_flushed = tl_401_responses;
+  }
+  if ((d = tl_401_dropped - tl_401_dropped_flushed)) {
+    prom_counter_add(turn_unauthenticated_401_dropped_responses, (double)d, NULL);
+    tl_401_dropped_flushed = tl_401_dropped;
+  }
+  if ((d = tl_401_would_drop - tl_401_would_drop_flushed)) {
+    prom_counter_add(turn_unauthenticated_401_would_drop_responses, (double)d, NULL);
+    tl_401_would_drop_flushed = tl_401_would_drop;
+  }
+  if ((d = tl_auth_fail_expired - tl_auth_fail_expired_flushed)) {
+    const char *label[] = {"expired"};
+    prom_counter_add(turn_auth_credential_failures, (double)d, label);
+    tl_auth_fail_expired_flushed = tl_auth_fail_expired;
+  }
+  if ((d = tl_auth_fail_mismatch - tl_auth_fail_mismatch_flushed)) {
+    const char *label[] = {"integrity_mismatch"};
+    prom_counter_add(turn_auth_credential_failures, (double)d, label);
+    tl_auth_fail_mismatch_flushed = tl_auth_fail_mismatch;
+  }
+  if ((d = tl_auth_fail_not_found - tl_auth_fail_not_found_flushed)) {
+    const char *label[] = {"not_found"};
+    prom_counter_add(turn_auth_credential_failures, (double)d, label);
+    tl_auth_fail_not_found_flushed = tl_auth_fail_not_found;
+  }
+}
+
+void prom_inc_auth_credential_failure(turn_key_lookup_result cause) {
+  if (turn_params.prometheus) {
+    switch (cause) {
+    case TURN_KEY_LOOKUP_EXPIRED:
+      tl_auth_fail_expired++;
+      break;
+    case TURN_KEY_LOOKUP_INTEGRITY_MISMATCH:
+      tl_auth_fail_mismatch++;
+      break;
+    default:
+      tl_auth_fail_not_found++;
+      break;
+    }
   }
 }
 
@@ -355,12 +661,31 @@ void prom_set_finished_traffic(const char *realm, const char *user, unsigned lon
   UNUSED_ARG(peer);
 }
 
-void prom_inc_allocation(SOCKET_TYPE type) { UNUSED_ARG(type); }
+void prom_inc_allocation(SOCKET_TYPE type, int family) {
+  UNUSED_ARG(type);
+  UNUSED_ARG(family);
+}
 
-void prom_dec_allocation(SOCKET_TYPE type) { UNUSED_ARG(type); }
+void prom_dec_allocation(SOCKET_TYPE type, int family) {
+  UNUSED_ARG(type);
+  UNUSED_ARG(family);
+}
 
-void prom_inc_packet_processed(int count) { UNUSED_ARG(count); }
+void prom_flush_udp_counters(const struct prom_udp_counter_deltas *d) { UNUSED_ARG(d); }
 
-void prom_inc_packet_dropped(int count) { UNUSED_ARG(count); }
+void prom_inc_unauthenticated_401_request(void) {}
+
+void prom_inc_unauthenticated_401_response(void) {}
+
+void prom_inc_unauthenticated_401_dropped_response(void) {}
+
+void prom_inc_unauthenticated_reply_verdict(int err_code, turn_ratelimit_verdict verdict) {
+  UNUSED_ARG(err_code);
+  UNUSED_ARG(verdict);
+}
+
+void prom_inc_auth_credential_failure(turn_key_lookup_result cause) { UNUSED_ARG(cause); }
+
+void prom_flush_401_counters(void) {}
 
 #endif /* TURN_NO_PROMETHEUS */

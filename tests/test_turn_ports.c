@@ -1,0 +1,262 @@
+/*
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * https://opensource.org/license/bsd-3-clause
+ *
+ * Regression test for issue #1649: the relay port allocator tracks its
+ * free-port ring with two monotonically increasing uint32_t cursors
+ * (low advances on every allocation attempt, high on every release).
+ * After ~4 billion operations on one pool the cursors wrap; with the old
+ * empty-pool guard `tp->high <= tp->low` a wrapped `high` and a not yet
+ * wrapped `low` made the guard permanently true, so the pool never
+ * allocated again until restart. The guard must use wrap-safe unsigned
+ * arithmetic (`(high - low) == 0`) instead.
+ *
+ * The test compiles the real src/apps/relay/turn_ports.c into this
+ * translation unit to reach the static turnports_* functions and the
+ * private struct layout, then fast-forwards the cursors to just below
+ * UINT32_MAX and drives real allocate/release cycles across the 2^32
+ * boundary.
+ */
+
+#include "unity.h"
+
+#include "../src/apps/relay/turn_ports.c"
+
+#include <stdio.h>
+#include <stdlib.h>
+
+/* ---- link stubs --------------------------------------------------------
+ * turn_ports.c also carries the turnipports_* layer, which references the
+ * super-memory allocator and ur_addr_map. The tests drive only the
+ * per-pool turnports_* level, so the map functions must never run. */
+
+void *allocate_super_memory_region_func(super_memory_t *region, size_t size, const char *file, const char *func,
+                                        int line) {
+  (void)region;
+  (void)file;
+  (void)func;
+  (void)line;
+  return calloc(1, size);
+}
+
+void ur_addr_map_init(ur_addr_map *map) {
+  (void)map;
+  abort();
+}
+
+bool ur_addr_map_put(ur_addr_map *map, ioa_addr *key, ur_addr_map_value_type value) {
+  (void)map;
+  (void)key;
+  (void)value;
+  abort();
+}
+
+bool ur_addr_map_get(const ur_addr_map *map, ioa_addr *key, ur_addr_map_value_type *value) {
+  (void)map;
+  (void)key;
+  (void)value;
+  abort();
+}
+
+/* ---- helpers ----------------------------------------------------------- */
+
+#define TEST_PORT_START 50000
+#define TEST_NPORTS 16
+#define TEST_PORT_END (TEST_PORT_START + TEST_NPORTS - 1)
+
+/* Advance both cursors (and every live queue-position entry in status[])
+ * by the same delta, as if delta alloc/release operations had already
+ * happened. delta must be a multiple of 0x10000 so the `cursor & 0xFFFF`
+ * ring positions - and therefore the ports[] layout - stay valid. */
+static void fast_forward(turnports *t, uint32_t delta) {
+  TEST_ASSERT_EQUAL_UINT32(0, delta & 0xFFFF);
+  t->low += delta;
+  t->high += delta;
+  for (size_t p = 0; p < PORTS_SIZE; ++p) {
+    if ((t->status[p] != TPS_OUT_OF_RANGE) && !is_taken(t->status[p])) {
+      t->status[p] += delta;
+    }
+  }
+}
+
+/* ---- tests ------------------------------------------------------------- */
+
+static void test_basic_allocate_release_cycle(void) {
+  turnports *t = turnports_create(NULL, TEST_PORT_START, TEST_PORT_END);
+  TEST_ASSERT_NOT_NULL(t);
+  TEST_ASSERT_EQUAL_UINT16(TEST_NPORTS, turnports_size(t));
+
+  uint8_t seen[TEST_NPORTS] = {0};
+  int ports[TEST_NPORTS] = {0};
+  for (int i = 0; i < TEST_NPORTS; ++i) {
+    const int port = turnports_allocate(t);
+    TEST_ASSERT_TRUE(port >= TEST_PORT_START && port <= TEST_PORT_END);
+    TEST_ASSERT_FALSE(seen[port - TEST_PORT_START]);
+    seen[port - TEST_PORT_START] = 1;
+    ports[i] = port;
+    TEST_ASSERT_TRUE(turnports_is_allocated(t, (uint16_t)port));
+  }
+
+  /* Pool exhausted: the guard must report empty, not spin. */
+  TEST_ASSERT_EQUAL_INT(-1, turnports_allocate(t));
+  TEST_ASSERT_EQUAL_UINT16(0, turnports_size(t));
+
+  for (int i = 0; i < TEST_NPORTS; ++i) {
+    turnports_release(t, (uint16_t)ports[i]);
+  }
+  TEST_ASSERT_EQUAL_UINT16(TEST_NPORTS, turnports_size(t));
+  TEST_ASSERT_TRUE(turnports_allocate(t) >= TEST_PORT_START);
+
+  free(t);
+}
+
+static void test_allocate_survives_counter_wraparound(void) {
+  turnports *t = turnports_create(NULL, TEST_PORT_START, TEST_PORT_END);
+  TEST_ASSERT_NOT_NULL(t);
+
+  /* Park the cursors just below UINT32_MAX, then walk real alloc/release
+   * cycles across the 2^32 boundary. With the pre-#1724 guard this fails
+   * permanently at the iteration where high wraps to 0 while low is still
+   * large. */
+  fast_forward(t, 0xFFFE0000u);
+  TEST_ASSERT_EQUAL_UINT16(TEST_NPORTS, turnports_size(t));
+
+  const uint32_t start_low = t->low;
+  int wrapped = 0;
+  for (uint32_t i = 0; i < 3 * 0x10000u; ++i) {
+    const int port = turnports_allocate(t);
+    if (port < 0) {
+      char msg[128] = {0};
+      snprintf(msg, sizeof(msg), "allocation failed at iteration %u (low=%u, high=%u)", i, t->low, t->high);
+      TEST_FAIL_MESSAGE(msg);
+    }
+    TEST_ASSERT_TRUE(port >= TEST_PORT_START && port <= TEST_PORT_END);
+    turnports_release(t, (uint16_t)port);
+    if (t->low < start_low) {
+      wrapped = 1;
+    }
+  }
+  TEST_ASSERT_TRUE_MESSAGE(wrapped, "test never drove the cursors across the 2^32 boundary");
+
+  /* The pool must still be usable after the wrap. Up to 4 ports may be
+   * lost when high passes through the TPS_* sentinel values
+   * (0xFFFFFFFC..0xFFFFFFFF) - a known residual of the counter-wrap
+   * design - but the pool must not degrade beyond that. */
+  int live = 0;
+  int drained[TEST_NPORTS] = {0};
+  while (live < TEST_NPORTS) {
+    const int port = turnports_allocate(t);
+    if (port < 0) {
+      break;
+    }
+    drained[live++] = port;
+  }
+  TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(TEST_NPORTS - 4, live, "too many ports leaked across the counter wrap");
+  for (int i = 0; i < live; ++i) {
+    turnports_release(t, (uint16_t)drained[i]);
+  }
+
+  free(t);
+}
+
+/* GHSA-847g-qmc6-6m4r: EVEN-PORT with the reservation (R) bit clear must
+ * allocate only the even port and leave its odd sibling in the pool. The
+ * pre-fix allocator marked the sibling TPS_TAKEN_ODD unconditionally, but for
+ * R=0 no RTCP socket is ever bound to it, so it was never released - every such
+ * allocation permanently lost one port. */
+static void test_evenport_r0_does_not_reserve_sibling(void) {
+  turnports *t = turnports_create(NULL, TEST_PORT_START, TEST_PORT_END);
+  TEST_ASSERT_NOT_NULL(t);
+
+  const int port = turnports_allocate_even(t, 0 /* R=0: no rtcp reservation */, NULL);
+  TEST_ASSERT_TRUE(port >= TEST_PORT_START && port <= TEST_PORT_END);
+  TEST_ASSERT_EQUAL_INT(0, port & 1);
+  TEST_ASSERT_TRUE(turnports_is_allocated(t, (uint16_t)port));
+  /* The odd sibling must stay available. */
+  TEST_ASSERT_TRUE(turnports_is_available(t, (uint16_t)(port + 1)));
+
+  turnports_release(t, (uint16_t)port);
+  TEST_ASSERT_EQUAL_UINT16(TEST_NPORTS, turnports_size(t));
+
+  free(t);
+}
+
+/* The leak's cumulative effect: clean allocate+deallocate cycles must not
+ * shrink the pool. Pre-fix it lost one port per cycle and returned -1 (508 on
+ * the wire) once drained. */
+static void test_evenport_r0_alloc_release_does_not_leak(void) {
+  turnports *t = turnports_create(NULL, TEST_PORT_START, TEST_PORT_END);
+  TEST_ASSERT_NOT_NULL(t);
+
+  for (int i = 0; i < 100; ++i) {
+    const int port = turnports_allocate_even(t, 0, NULL);
+    char msg[96] = {0};
+    snprintf(msg, sizeof(msg), "EVEN-PORT(R=0) allocation failed at cycle %d (pool leaked)", i);
+    TEST_ASSERT_TRUE_MESSAGE(port >= TEST_PORT_START && port <= TEST_PORT_END, msg);
+    TEST_ASSERT_EQUAL_INT(0, port & 1);
+    turnports_release(t, (uint16_t)port);
+    TEST_ASSERT_EQUAL_UINT16(TEST_NPORTS, turnports_size(t));
+  }
+
+  free(t);
+}
+
+/* turnports_allocate() reports failure as -1. turnports_allocate_even() must
+ * not feed that -1 to turnports_release(): the uint16_t parameter turns it into
+ * 65535, and when the range includes 65535 (the default max) and that port is
+ * held by another allocation, the release frees it out from under its owner. */
+static void test_evenport_failure_keeps_foreign_port(void) {
+  turnports *t = turnports_create(NULL, 65534, 65535);
+  TEST_ASSERT_NOT_NULL(t);
+
+  /* Port 65535 is held by a different allocation. */
+  t->status[65535] = TPS_TAKEN_SINGLE;
+  TEST_ASSERT_TRUE(turnports_is_allocated(t, 65535));
+
+  /* Make the next dequeue land on an out-of-range queue entry so
+   * turnports_allocate() returns -1 (turn_ports.c:185) while the pool still
+   * reports a non-empty size and the EVEN-PORT loop runs. */
+  t->ports[t->low & 0xFFFF] = 0;
+  TEST_ASSERT_GREATER_THAN_UINT16(1, turnports_size(t));
+
+  /* No even port can be allocated, so this fails - without touching 65535. */
+  TEST_ASSERT_EQUAL_INT(-1, turnports_allocate_even(t, 1, NULL));
+  TEST_ASSERT_TRUE_MESSAGE(turnports_is_allocated(t, 65535),
+                           "EVEN-PORT failure released a port held by another allocation");
+
+  free(t);
+}
+
+/* R=1 (reservation requested) must still hold the odd sibling so a later
+ * RESERVATION-TOKEN allocation can claim it. */
+static void test_evenport_r1_reserves_sibling(void) {
+  turnports *t = turnports_create(NULL, TEST_PORT_START, TEST_PORT_END);
+  TEST_ASSERT_NOT_NULL(t);
+
+  uint64_t token = 0;
+  const int port = turnports_allocate_even(t, 1 /* R=1: reserve rtcp */, &token);
+  TEST_ASSERT_TRUE(port >= TEST_PORT_START && port <= TEST_PORT_END);
+  TEST_ASSERT_EQUAL_INT(0, port & 1);
+  TEST_ASSERT_TRUE(turnports_is_allocated(t, (uint16_t)port));
+  /* Sibling is held, not free. */
+  TEST_ASSERT_FALSE(turnports_is_available(t, (uint16_t)(port + 1)));
+
+  free(t);
+}
+
+/* ---- harness ----------------------------------------------------------- */
+
+void setUp(void) {}
+void tearDown(void) {}
+
+int main(void) {
+  UNITY_BEGIN();
+  RUN_TEST(test_basic_allocate_release_cycle);
+  RUN_TEST(test_allocate_survives_counter_wraparound);
+  RUN_TEST(test_evenport_r0_does_not_reserve_sibling);
+  RUN_TEST(test_evenport_r0_alloc_release_does_not_leak);
+  RUN_TEST(test_evenport_failure_keeps_foreign_port);
+  RUN_TEST(test_evenport_r1_reserves_sibling);
+  return UNITY_END();
+}

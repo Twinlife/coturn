@@ -42,6 +42,9 @@
 
 #include <hiredis/async.h>
 #include <hiredis/hiredis.h>
+#if defined(TURN_HAVE_HIREDIS_SSL)
+#include <hiredis/hiredis_ssl.h>
+#endif
 
 //////////////// Libevent context ///////////////////////
 
@@ -57,12 +60,33 @@ struct redisLibeventEvents {
   char *user;
   char *pwd;
   int db;
+  void *ssl_ctx; /* redisSSLContext*, or NULL for a plaintext connection */
 };
+
+/* Initiate TLS on a freshly created async context. Returns 0 on success (or
+   when no TLS is configured), -1 on failure. The handshake itself completes
+   asynchronously through the normal read/write events. */
+static int redis_le_init_ssl(struct redisLibeventEvents *e, redisAsyncContext *ac) {
+  if (!e || !e->ssl_ctx) {
+    return 0;
+  }
+#if defined(TURN_HAVE_HIREDIS_SSL)
+  if (redisInitiateSSLWithContext(&ac->c, (redisSSLContext *)e->ssl_ctx) != REDIS_OK) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: Redis TLS init failed: %s\n", __FUNCTION__, ac->c.errstr);
+    return -1;
+  }
+  return 0;
+#else
+  (void)ac;
+  TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: Redis TLS requested but hiredis_ssl support is not compiled in\n",
+                __FUNCTION__);
+  return -1;
+#endif
+}
 
 ///////////// Messages ////////////////////////////
 
 struct redis_message {
-  char format[513];
   char arg[513];
 };
 
@@ -199,15 +223,13 @@ void send_message_to_redis(redis_context_handle rch, const char *command, const 
 
       struct redis_message rm;
 
-      snprintf(rm.format, sizeof(rm.format) - 3, "%s %s ", command, key);
-      strcpy(rm.format + strlen(rm.format), "%s");
-
       va_list args;
       va_start(args, format);
       vsnprintf(rm.arg, sizeof(rm.arg) - 1, format, args);
       va_end(args);
+      rm.arg[sizeof(rm.arg) - 1] = 0;
 
-      if ((redisAsyncCommand(ac, NULL, e, rm.format, rm.arg) != REDIS_OK)) {
+      if ((redisAsyncCommand(ac, NULL, e, "%s %s %s", command, key, rm.arg) != REDIS_OK)) {
         e->invalid = 1;
         TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: Redis connection broken: ac=0x%p, e=0x%p\n", __FUNCTION__, ac, e);
       }
@@ -217,7 +239,8 @@ void send_message_to_redis(redis_context_handle rch, const char *command, const 
 
 ///////////////////////// Attach /////////////////////////////////
 
-redis_context_handle redisLibeventAttach(struct event_base *base, char *ip0, int port0, char *user, char *pwd, int db) {
+redis_context_handle redisLibeventAttach(struct event_base *base, char *ip0, int port0, char *user, char *pwd, int db,
+                                         void *ssl_ctx) {
 
   char ip[256];
   if (ip0 && ip0[0]) {
@@ -237,27 +260,37 @@ redis_context_handle redisLibeventAttach(struct event_base *base, char *ip0, int
     return NULL;
   } else if (ac->err) {
     fprintf(stderr, "Error: %s:%s\n", ac->errstr, ac->c.errstr);
+    redisAsyncFree(ac);
     return NULL;
   }
 
   /* Create container for context and r/w events */
-  struct redisLibeventEvents *e = (struct redisLibeventEvents *)calloc(1, sizeof(struct redisLibeventEvents));
-  if (!e) {
-    return NULL;
-  }
+  struct redisLibeventEvents *e = (struct redisLibeventEvents *)turn_calloc(1, sizeof(struct redisLibeventEvents));
 
   e->allocated = 1;
   e->context = ac;
   e->base = base;
-  e->ip = strdup(ip);
+  e->ip = turn_strdup(ip);
   e->port = port;
   if (user) {
-    e->user = strdup(user);
+    e->user = turn_strdup(user);
   }
   if (pwd) {
-    e->pwd = strdup(pwd);
+    e->pwd = turn_strdup(pwd);
   }
   e->db = db;
+  e->ssl_ctx = ssl_ctx;
+
+  /* Upgrade to TLS before any command (AUTH/SELECT) is queued. */
+  if (redis_le_init_ssl(e, ac) < 0) {
+    redisAsyncFree(ac);
+    e->context = NULL;
+    free(e->ip);
+    free(e->user);
+    free(e->pwd);
+    free(e);
+    return NULL;
+  }
 
   /* Register functions to start/stop listening for events */
   ac->ev.addRead = redisLibeventAddRead;
@@ -274,6 +307,11 @@ redis_context_handle redisLibeventAttach(struct event_base *base, char *ip0, int
   e->wev = event_new(e->base, e->context->c.fd, EV_WRITE, redisLibeventWriteEvent, e);
 
   if (e->rev == NULL || e->wev == NULL) {
+    redisAsyncFree(ac);
+    e->context = NULL;
+    free(e->ip);
+    free(e->user);
+    free(e->pwd);
     free(e);
     return NULL;
   }
@@ -338,7 +376,19 @@ static void redis_reconnect(struct redisLibeventEvents *e) {
     return;
   }
 
+  if (ac->err) {
+    redisAsyncFree(ac);
+    return;
+  }
+
   e->context = ac;
+
+  /* Re-upgrade to TLS before any command is queued on the new context. */
+  if (redis_le_init_ssl(e, ac) < 0) {
+    redisAsyncFree(ac);
+    e->context = NULL;
+    return;
+  }
 
   /* Register functions to start/stop listening for events */
   ac->ev.addRead = redisLibeventAddRead;
@@ -355,6 +405,8 @@ static void redis_reconnect(struct redisLibeventEvents *e) {
   e->wev = event_new(e->base, e->context->c.fd, EV_WRITE, redisLibeventWriteEvent, e);
 
   if (e->rev == NULL || e->wev == NULL) {
+    redisAsyncFree(ac);
+    e->context = NULL;
     return;
   }
 

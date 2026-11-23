@@ -37,6 +37,7 @@
 
 #include <limits.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,6 +71,7 @@
 
 #include "ns_turn_openssl.h"
 
+#include "ns_turn_atomic.h"
 #include "ns_turn_khash.h"
 #include "ns_turn_utils.h"
 
@@ -87,7 +89,9 @@
 #include "ns_ioalib_impl.h"
 
 #include <openssl/aes.h>
+#include <openssl/decoder.h>
 #include <openssl/err.h>
+#include <openssl/param_build.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 
@@ -109,6 +113,13 @@ extern _Atomic
 #endif
     size_t global_allocation_count; // used for drain mode, to know when all allocations have gone away
 
+#ifdef _MSC_VER
+/* windows.h for the Interlocked* ops used by global_allocation_count below.
+ * The band_limit_t bandwidth counters use the portable wrappers in
+ * ns_turn_atomic.h instead of per-file MSVC shims. */
+#include <windows.h>
+#endif /* _MSC_VER */
+
 ////////////// DEFINES ////////////////////////////
 
 #define DEFAULT_CONFIG_FILE "turnserver.conf"
@@ -128,9 +139,6 @@ extern _Atomic
 #define DEFAULT_EC_CURVE_NAME "prime256v1"
 
 #define MAX_NUMBER_OF_GENERAL_RELAY_SERVERS ((uint8_t)(0x80))
-
-#define TURNSERVER_ID_BOUNDARY_BETWEEN_TCP_AND_UDP MAX_NUMBER_OF_GENERAL_RELAY_SERVERS
-#define TURNSERVER_ID_BOUNDARY_BETWEEN_UDP_AND_TCP TURNSERVER_ID_BOUNDARY_BETWEEN_TCP_AND_UDP
 
 #define DEFAULT_CPUS_NUMBER (2)
 
@@ -174,18 +182,6 @@ struct listener_server {
   dtls_listener_relay_server_type ***aux_udp_services;
 };
 
-enum _NET_ENG_VERSION {
-  NEV_UNKNOWN = 0,
-  NEV_MIN,
-  NEV_UDP_SOCKET_PER_SESSION = NEV_MIN,
-  NEV_UDP_SOCKET_PER_ENDPOINT,
-  NEV_UDP_SOCKET_PER_THREAD,
-  NEV_MAX = NEV_UDP_SOCKET_PER_THREAD,
-  NEV_TOTAL
-};
-
-typedef enum _NET_ENG_VERSION NET_ENG_VERSION;
-
 /////////// PARAMS //////////////////////////////////
 
 typedef struct _turn_params_ {
@@ -211,7 +207,7 @@ typedef struct _turn_params_ {
   bool enable_tlsv1_1;
   bool no_tlsv1_2;
   bool no_tls;
-  bool no_dtls;
+  bool dtls;
 
   struct event *tls_ctx_update_ev;
   TURN_MUTEX_DECLARE(tls_mutex)
@@ -230,11 +226,12 @@ typedef struct _turn_params_ {
 
   ////////////////  Listener server /////////////////
 
-  int listener_port;
-  int tls_listener_port;
-  int alt_listener_port;
-  int alt_tls_listener_port;
-  int tcp_proxy_port;
+  uint16_t listener_port;
+  uint16_t tls_listener_port;
+  uint16_t alt_listener_port;
+  uint16_t alt_tls_listener_port;
+  bool tls_port_configured;
+  uint16_t tcp_proxy_port;
   bool rfc5780;
 
   bool no_udp;
@@ -253,9 +250,6 @@ typedef struct _turn_params_ {
 
   ip_range_list_t ip_whitelist;
   ip_range_list_t ip_blacklist;
-
-  NET_ENG_VERSION net_engine_version;
-  const char *net_engine_version_txt[NEV_TOTAL];
 
   //////////////// Relay servers /////////////
 
@@ -278,7 +272,7 @@ typedef struct _turn_params_ {
   ioa_addr *external_ip;
 
   turnserver_id general_relay_servers_number;
-  turnserver_id udp_relay_servers_number;
+  bool relay_threads_configured;
 
   int sock_buf_size;
 
@@ -297,11 +291,18 @@ typedef struct _turn_params_ {
 
   turn_server_addrs_list_t alternate_servers_list;
   turn_server_addrs_list_t tls_alternate_servers_list;
+  turn_server_addrs_list_t tcp_alternate_servers_list;
+  turn_server_addrs_list_t udp_alternate_servers_list;
 
   /////////////// stop/drain server ////////////////
   bool drain_turn_server;
+  /* Drain completes once the active allocation count drops to this value
+   * (default 0: wait for every allocation to go away). */
+  size_t drain_min_allocations;
   /////////////// stop server ////////////////
-  bool stop_turn_server;
+  /* Written from the signal handler and the admin thread, read by every
+   * worker loop — volatile so those reads are not optimized away. */
+  volatile bool stop_turn_server;
 
   ////////////// MISC PARAMS ////////////////
 
@@ -318,16 +319,21 @@ typedef struct _turn_params_ {
   bool mobility;
   turn_credential_type ct;
   bool use_auth_secret_with_timestamp;
-  band_limit_t max_bps;
-  band_limit_t bps_capacity;
-  band_limit_t bps_capacity_allocated;
+  turn_atomic_u32 max_bps;
+  turn_atomic_u32 bps_capacity;
+  turn_atomic_u32 bps_capacity_allocated;
   vint total_quota;
   vint user_quota;
   bool prometheus;
-  int prometheus_port;
+  uint16_t prometheus_port;
   char prometheus_address[INET6_ADDRSTRLEN];
   char prometheus_path[1025];
   bool prometheus_username_labels;
+  bool prometheus_tls; /* serve the metrics endpoint over HTTPS */
+  /* PEM cert/key for the HTTPS metrics endpoint; empty means fall back to the
+   * server's main --cert / --pkey. */
+  char prometheus_cert_file[1025];
+  char prometheus_pkey_file[1025];
 
   /////// Users DB ///////////
 
@@ -348,24 +354,55 @@ typedef struct _turn_params_ {
 
   bool log_binding;
   bool stun_backward_compatibility;
+  bool rfc5766_channel_numbers;
+  bool rfc3489_compatibility;
   bool respond_http_unsupported;
-  bool drop_invalid_packets;
   bool drop_invalid_packets_log;
+#if defined(__linux__)
+  bool udp_recvmmsg;
+  bool udp_recvmmsg_log;
+  bool udp_sendmmsg; /* derived: multiplex_peer; not user-settable */
+  bool udp_sendmmsg_log;
+  bool udp_gso;
+#endif
+  bool include_reason_string;
+
+  bool multiplex_peer;               /* --multiplex-peer flag */
+  uint16_t multiplex_peer_base_port; /* --multiplex-peer-port (default 3480) */
+  size_t multiplex_peer_max_peers;   /* --multiplex-peer-max-peers (0 = built-in default) */
+
+  turn_ratelimit_mode ratelimit_unauthorized_mode;
+  vint ratelimit_unauthorized_requests_per_sec;
+
+  /* --stateless-nonce (issue #1999): derive challenge nonces from a
+   * process-wide secret key so unauthenticated UDP requests can be answered
+   * (and their sessions torn down) without keeping per-client state. The key
+   * is generated once at startup. */
+  bool stateless_nonce;
+  uint8_t stateless_nonce_key[TURN_STATELESS_NONCE_KEY_SIZE];
+  /* true when the key was derived from --stateless-nonce-secret (shared
+   * across a fleet); false means an ephemeral random key is generated at
+   * startup. */
+  bool stateless_nonce_key_set;
+
+  /* --oauth-legacy-mac-key: key OAuth MESSAGE-INTEGRITY with only the first 16 bytes of the
+   * mac_key instead of all of it (RFC 7635 Section 6.2), for peers that depend on that. */
+  bool oauth_legacy_mac_key;
 } turn_params_t;
 
 extern turn_params_t turn_params;
 
 ////////////////  Listener server /////////////////
 
-static inline int get_alt_listener_port(void) {
-  if (turn_params.alt_listener_port < 1) {
+static inline uint16_t get_alt_listener_port(void) {
+  if (turn_params.alt_listener_port == 0) {
     return turn_params.listener_port + 1;
   }
   return turn_params.alt_listener_port;
 }
 
-static inline int get_alt_tls_listener_port(void) {
-  if (turn_params.alt_tls_listener_port < 1) {
+static inline uint16_t get_alt_tls_listener_port(void) {
+  if (turn_params.alt_tls_listener_port == 0) {
     return turn_params.tls_listener_port + 1;
   }
   return turn_params.alt_tls_listener_port;
@@ -377,6 +414,10 @@ void add_alternate_server(const char *saddr);
 void del_alternate_server(const char *saddr);
 void add_tls_alternate_server(const char *saddr);
 void del_tls_alternate_server(const char *saddr);
+void add_tcp_alternate_server(const char *saddr);
+void del_tcp_alternate_server(const char *saddr);
+void add_udp_alternate_server(const char *saddr);
+void del_udp_alternate_server(const char *saddr);
 
 ////////// Addrs ////////////////////
 
@@ -394,6 +435,7 @@ void send_auth_message_to_auth_server(struct auth_message *am);
 
 void init_listener(void);
 void setup_server(void);
+void shutdown_server(void);
 void run_listener_server(struct listener_server *ls);
 void enable_drain_mode(void);
 

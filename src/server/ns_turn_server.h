@@ -35,6 +35,7 @@
 #ifndef __TURN_SERVER__
 #define __TURN_SERVER__
 
+#include "ns_turn_ratelimit.h"
 #include "ns_turn_session.h"
 #include "ns_turn_utils.h"
 
@@ -68,6 +69,11 @@ typedef int (*send_message_cb)(ioa_engine_handle e, ioa_network_buffer_handle nb
 
 extern int TURN_MAX_ALLOCATE_TIMEOUT;
 extern int TURN_MAX_ALLOCATE_TIMEOUT_STUN_ONLY;
+/* Seconds to wait for a DTLS handshake to finish before reclaiming the session. */
+extern int TURN_DTLS_HALF_OPEN_TIMEOUT;
+
+/* Cap on the attributes reported back in a 420 UNKNOWN-ATTRIBUTES response. */
+#define MAX_NUMBER_OF_UNKNOWN_ATTRS (128)
 
 typedef uint8_t turnserver_id;
 
@@ -97,7 +103,8 @@ typedef enum {
 struct _turn_turnserver;
 typedef struct _turn_turnserver turn_turnserver;
 
-typedef void (*get_username_resume_cb)(int success, int oauth, int max_session_time, hmackey_t hmackey, password_t pwd,
+typedef void (*get_username_resume_cb)(int success, turn_key_lookup_result key_lookup, int oauth,
+                                       uint64_t oauth_expiration_time, hmackey_t hmackey, password_t pwd,
                                        turn_turnserver *server, uint64_t ctxkey, ioa_net_data *in_buffer,
                                        uint8_t *realm);
 typedef uint8_t *(*get_user_key_cb)(turnserver_id id, turn_credential_type ct, int in_oauth, int *out_oauth,
@@ -112,6 +119,11 @@ typedef int (*send_turn_session_info_cb)(struct turn_session_info *tsi);
 typedef void (*send_https_socket_cb)(ioa_socket_handle s);
 
 typedef band_limit_t (*allocate_bps_cb)(band_limit_t bps, int positive);
+typedef void (*unauthenticated_401_metric_cb)(void);
+/* Every UDP reply to an unverified source (401, and the listener's stateless
+ * 400/437/438), with its rate-limit verdict; SENT when the limit is off. */
+typedef void (*unauthenticated_reply_metric_cb)(int err_code, turn_ratelimit_verdict verdict);
+typedef void (*auth_credential_failure_metric_cb)(turn_key_lookup_result cause);
 
 struct _turn_turnserver {
 
@@ -164,6 +176,10 @@ struct _turn_turnserver {
   size_t as_counter;
   turn_server_addrs_list_t *tls_alternate_servers_list;
   size_t tls_as_counter;
+  turn_server_addrs_list_t *tcp_alternate_servers_list;
+  size_t tcp_as_counter;
+  turn_server_addrs_list_t *udp_alternate_servers_list;
+  size_t udp_as_counter;
   turn_server_addrs_list_t *aux_servers_list;
   int self_udp_balance;
 
@@ -184,6 +200,9 @@ struct _turn_turnserver {
   /* oAuth: */
   int oauth;
   const char *oauth_server_name;
+  /* Points into turn_params: truncate the OAuth mac_key to 16 bytes for MESSAGE-INTEGRITY, for
+     peers built against the old non-RFC 7635 behavior. NULL means off. */
+  bool *oauth_legacy_mac_key;
 
   /* ACME redirect URL */
   const char *acme_redirect;
@@ -194,37 +213,75 @@ struct _turn_turnserver {
   /* Log Binding Requrest */
   bool *log_binding;
 
-  /* Enable handling old STUN Binding Requests and enable MAPPED-ADDRESS attribute in response */
+  /* Add the deprecated MAPPED-ADDRESS attribute to Binding responses, alongside XOR-MAPPED-ADDRESS */
   bool *stun_backward_compatibility;
+
+  /* Accept ChannelBind channel numbers from the obsolete RFC 5766 range
+     0x5000-0x7FFF, which RFC 8656 reserves for multiplexing (RFC 7983) */
+  bool *rfc5766_channel_numbers;
+
+  /* DEPRECATED: handle obsolete RFC 3489 ("classic" STUN) Binding Requests, which carry no magic
+   * cookie. Scheduled for removal in the next major release. */
+  bool *rfc3489_compatibility;
 
   /* Return an HTTP 400 response to HTTP connections made to ports not
      otherwise handling HTTP. */
   bool *respond_http_unsupported;
 
+  /* Include descriptive reason strings in STUN/TURN error responses. */
+  bool include_reason_string;
+
   /* Set to true on SIGUSR1 */
   bool is_draining;
+
+  bool multiplex_peer_mode;
+
+  /* Both of these are pointers into turn_params so the CLI flags affect
+   * every relay thread without per-thread copies. They must stay pointers
+   * (not a `bool`/value copy): the server dereferences them live at the use
+   * sites, so a value copy would snapshot the flag at struct-init time and
+   * ignore later updates. */
+  turn_ratelimit_mode *ratelimit_unauthorized_mode;
+  vintp ratelimit_unauthorized_requests_per_sec;
+  unauthenticated_401_metric_cb unauthenticated_401_request_cb;
+  unauthenticated_401_metric_cb unauthenticated_401_response_cb;
+  unauthenticated_401_metric_cb unauthenticated_401_dropped_response_cb;
+  unauthenticated_reply_metric_cb unauthenticated_reply_cb;
+  auth_credential_failure_metric_cb auth_credential_failure_cb;
+
+  /* Stateless-nonce mode (issue #1999): challenge nonces are authenticated
+   * timestamp cookies (turn_generate_stateless_nonce() /
+   * turn_check_stateless_nonce()) instead of random values, so unauthenticated
+   * UDP sessions do not have to be kept alive just to remember the nonce.
+   * `stateless_nonce` points into turn_params (same live-flag rule as the
+   * ratelimit fields above); the key is process-wide and shared by every
+   * relay thread and listener. */
+  bool *stateless_nonce;
+  const uint8_t *stateless_nonce_key;
+  size_t stateless_nonce_key_size;
 };
 
 const char *get_version(turn_turnserver *server);
 
 ///////////////////////////////////////////
 
-void init_turn_server(turn_turnserver *server, turnserver_id id, int verbose, ioa_engine_handle e,
-                      turn_credential_type ct, int fingerprint, dont_fragment_option_t dont_fragment,
-                      get_user_key_cb userkeycb, check_new_allocation_quota_cb chquotacb,
-                      release_allocation_quota_cb raqcb, ioa_addr *external_addr, bool *check_origin,
-                      bool *no_tcp_relay, bool *no_udp_relay, vintp stale_nonce, vintp max_allocate_lifetime,
-                      vintp channel_lifetime, vintp permission_lifetime, bool *stun_only, bool *no_stun,
-                      bool software_attribute, bool *web_admin_listen_on_workers,
-                      turn_server_addrs_list_t *alternate_servers_list,
-                      turn_server_addrs_list_t *tls_alternate_servers_list, turn_server_addrs_list_t *aux_servers_list,
-                      int self_udp_balance, bool *no_multicast_peers, bool *allow_loopback_peers,
-                      ip_range_list_t *ip_whitelist, ip_range_list_t *ip_blacklist,
-                      send_socket_to_relay_cb send_socket_to_relay, bool *secure_stun, bool *mobility, int server_relay,
-                      send_turn_session_info_cb send_turn_session_info, send_https_socket_cb send_https_socket,
-                      int sock_buf_size, allocate_bps_cb allocate_bps_func, int oauth, const char *oauth_server_name,
-                      const char *acme_redirect, ALLOCATION_DEFAULT_ADDRESS_FAMILY allocation_default_address_family,
-                      bool *log_binding, bool *stun_backward_compatibility, bool *respond_http_unsupported);
+void init_turn_server(
+    turn_turnserver *server, turnserver_id id, int verbose, ioa_engine_handle e, turn_credential_type ct,
+    int fingerprint, dont_fragment_option_t dont_fragment, get_user_key_cb userkeycb,
+    check_new_allocation_quota_cb chquotacb, release_allocation_quota_cb raqcb, ioa_addr *external_addr,
+    bool *check_origin, bool *no_tcp_relay, bool *no_udp_relay, vintp stale_nonce, vintp max_allocate_lifetime,
+    vintp channel_lifetime, vintp permission_lifetime, bool *stun_only, bool *no_stun, bool software_attribute,
+    bool *web_admin_listen_on_workers, turn_server_addrs_list_t *alternate_servers_list,
+    turn_server_addrs_list_t *tls_alternate_servers_list, turn_server_addrs_list_t *tcp_alternate_servers_list,
+    turn_server_addrs_list_t *udp_alternate_servers_list, turn_server_addrs_list_t *aux_servers_list,
+    int self_udp_balance, bool *no_multicast_peers, bool *allow_loopback_peers, ip_range_list_t *ip_whitelist,
+    ip_range_list_t *ip_blacklist, send_socket_to_relay_cb send_socket_to_relay, bool *secure_stun, bool *mobility,
+    int server_relay, send_turn_session_info_cb send_turn_session_info, send_https_socket_cb send_https_socket,
+    int sock_buf_size, allocate_bps_cb allocate_bps_func, int oauth, const char *oauth_server_name,
+    const char *acme_redirect, ALLOCATION_DEFAULT_ADDRESS_FAMILY allocation_default_address_family, bool *log_binding,
+    bool *stun_backward_compatibility, bool *rfc5766_channel_numbers, bool *rfc3489_compatibility,
+    bool *respond_http_unsupported, bool include_reason_string, turn_ratelimit_mode *ratelimit_unauthorized_mode,
+    vintp ratelimit_unauthorized_requests_per_sec);
 
 ioa_engine_handle turn_server_get_engine(turn_turnserver *s);
 
@@ -235,8 +292,31 @@ void set_rfc5780(turn_turnserver *server, get_alt_addr_cb cb, send_message_cb sm
 ///////////////////////////////////////////
 
 int open_client_connection_session(turn_turnserver *server, struct socket_message *sm);
+/* After a DTLS handshake finishes, restore the normal allocation-establishment timer. */
+void turn_session_refresh_to_be_allocated_timeout(ts_ur_super_session *ss);
 int shutdown_client_connection(turn_turnserver *server, ts_ur_super_session *ss, int force, const char *reason);
+
+bool turn_should_reap_unallocated_noauth_udp(const turn_turnserver *server, const ts_ur_super_session *ss);
 void set_disconnect_cb(turn_turnserver *server, int (*disconnect)(ts_ur_super_session *));
+void set_unauthenticated_401_metric_cbs(turn_turnserver *server, unauthenticated_401_metric_cb request_cb,
+                                        unauthenticated_401_metric_cb response_cb,
+                                        unauthenticated_401_metric_cb dropped_response_cb);
+void set_unauthenticated_reply_metric_cb(turn_turnserver *server, unauthenticated_reply_metric_cb cb);
+void set_auth_credential_failure_metric_cb(turn_turnserver *server, auth_credential_failure_metric_cb cb);
+void set_stateless_nonce(turn_turnserver *server, bool *enabled, const uint8_t *key, size_t key_size);
+void turn_server_set_oauth_legacy_mac_key(turn_turnserver *server, bool *enabled);
+
+/* turn_server_stateless_nonce_enabled() is shared with the UDP listener fast
+ * path (dtls_listener.c), which answers MESSAGE-INTEGRITY-less requests
+ * without creating a session; the lifetime accessor backs nonce validation in
+ * check_stun_auth(). */
+bool turn_server_stateless_nonce_enabled(const turn_turnserver *server);
+turn_time_t turn_server_stateless_nonce_lifetime(const turn_turnserver *server);
+
+/* Charge one UDP reply to an unverified source against its
+ * --unauthorized-ratelimit budget, log and report the verdict. Returns true
+ * when the caller must not send the reply (enforce mode, over the limit). */
+bool turn_server_unauthenticated_reply_suppressed(turn_turnserver *server, const ioa_addr *src, int err_code);
 
 int turnserver_accept_tcp_client_data_connection(turn_turnserver *server, tcp_connection_id tcid, stun_tid *tid,
                                                  ioa_socket_handle s, int message_integrity, ioa_net_data *nd,
@@ -247,6 +327,9 @@ int report_turn_session_info(turn_turnserver *server, ts_ur_super_session *ss, i
 turn_time_t get_turn_server_time(turn_turnserver *server);
 
 void turn_cancel_session(turn_turnserver *server, turnsession_id sid);
+
+/* Non-static relay input handler — called by multiplex-peer dispatch */
+void turn_peer_input_handler(ioa_socket_handle s, int event_type, ioa_net_data *data, void *arg, int can_resume);
 
 ///////////////////////////////////////////
 

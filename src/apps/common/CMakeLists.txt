@@ -84,11 +84,34 @@ else()
         message(FATAL_ERROR "Must set Libevent")
     endif()
 endif()
+
+if(TARGET libevent::openssl)
+    get_target_property(_event_openssl_lib libevent::openssl IMPORTED_LOCATION)
+    if(NOT _event_openssl_lib)
+        get_target_property(_event_openssl_lib libevent::openssl IMPORTED_LOCATION_RELEASE)
+    endif()
+else()
+    foreach(_lib ${Libevent_LIBRARIES})
+        if(_lib MATCHES "event_openssl")
+            set(_event_openssl_lib "${_lib}")
+        endif()
+    endforeach()
+endif()
+string(REGEX MATCH "^[0-9]+" _ssl_major "${OPENSSL_VERSION}")
+include(CheckLibeventOpenSSL)
+turn_check_libevent_openssl_abi("${_event_openssl_lib}" "${_ssl_major}")
+
 message("COMMON_LIBS:${COMMON_LIBS}")
 
 add_library(${PROJECT_NAME} STATIC ${SOURCE_FILES} ${HEADER_FILES})
 
 target_link_libraries(${PROJECT_NAME} PUBLIC ${COMMON_LIBS})
+# turncommon and turnclient are mutually dependent static libraries:
+# stun_buffer.c and ns_turn_utils.c call stun_*/addr_* from turnclient, while
+# turnclient calls the logging functions here. Declaring the cycle makes CMake
+# repeat both archives on the link line so single-pass linkers (GNU ld) can
+# resolve symbols regardless of which library is scanned first.
+target_link_libraries(${PROJECT_NAME} PUBLIC turnclient)
 target_compile_definitions(${PROJECT_NAME} PUBLIC ${COMMON_DEFINED})
 target_compile_options(${PROJECT_NAME} PUBLIC
 	$<$<C_COMPILER_ID:GNU>:-Wno-deprecated-declarations>
